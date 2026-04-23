@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 45
 
     permissions:
-      contents: write   # Để commit CSV vào nhánh data
+      contents: write # Để commit CSV vào nhánh data
 
     steps:
       # ── 1. Checkout ──────────────────────────────────────────────────────
@@ -43,10 +43,11 @@ jobs:
       # ── 4. Run crawler ───────────────────────────────────────────────────
       - name: Run job crawler
         env:
-          TEAMS_WEBHOOK_URL:            ${{ secrets.TEAMS_WEBHOOK_URL }}
-          GOOGLE_SERVICE_ACCOUNT_JSON:  ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
-          GOOGLE_DRIVE_FOLDER_ID:       ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
-          JOB_PROXY:                    ${{ secrets.JOB_PROXY }}
+          POWER_AUTOMATE_URL: ${{ secrets.POWER_AUTOMATE_URL }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
+          JOB_PROXY: ${{ secrets.JOB_PROXY }}
           GITHUB_RUN_URL: >-
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GITHUB_REPO: ${{ github.repository }}
