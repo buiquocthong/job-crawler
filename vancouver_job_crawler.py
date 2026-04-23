@@ -27,6 +27,7 @@ from pathlib import Path
 import pandas as pd
 import requests
 from jobspy import scrape_jobs
+import base64
 
 # Google Drive (optional — chỉ import khi cần)
 try:
@@ -501,7 +502,13 @@ def upload_to_drive(csv_path: Path) -> str | None:
         return None
 
     try:
-        sa_info = json.loads(GDRIVE_SA_JSON)
+        # sa_info = json.loads(GDRIVE_SA_JSON)
+
+        try:
+            decoded = base64.b64decode(GDRIVE_SA_JSON).decode("utf-8")
+            sa_info = json.loads(decoded)
+        except Exception:
+            sa_info = json.loads(GDRIVE_SA_JSON)
         creds = service_account.Credentials.from_service_account_info(
             sa_info,
             scopes=["https://www.googleapis.com/auth/drive"]
