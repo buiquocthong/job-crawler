@@ -1,30 +1,41 @@
 #!/usr/bin/env python3
 """
-Vancouver Job Crawler
-=====================
+Vancouver Job Crawler  (v2 — Google Drive + Salary Fix)
+========================================================
 Crawl Indeed + Glassdoor: tài chính / data science / C-suite
-Lọc: Vancouver BC area | min $60k/yr hoặc $30/hr | 3 ngày gần nhất
-Tích hợp: Gửi báo cáo qua MS Teams Incoming Webhook
+Lọc  : Vancouver BC area | min $60k/yr hoặc $30/hr | 3 ngày gần nhất
+Upload: Google Drive (Service Account) → gửi link folder qua MS Teams
 
 Cách chạy:
   pip install -r requirements.txt
   python3 vancouver_job_crawler.py        # Chạy thật
-  python3 vancouver_job_crawler.py --demo # Demo không cần proxy
+  python3 vancouver_job_crawler.py --demo # Demo không cần proxy/credentials
 
 Biến môi trường (set trong GitHub Secrets):
-  TEAMS_WEBHOOK_URL  — URL webhook kênh Teams
-  JOB_PROXY          — "user:pass@host:port"  (tuỳ chọn)
-  GITHUB_RUN_URL     — tự điền bởi workflow
-  GITHUB_REPO        — "owner/repo"  (tự điền bởi workflow)
+  TEAMS_WEBHOOK_URL         — URL webhook kênh Teams
+  GOOGLE_SERVICE_ACCOUNT_JSON — JSON string của Google Service Account
+  GOOGLE_DRIVE_FOLDER_ID    — ID folder Google Drive (share với service account)
+  JOB_PROXY                 — "user:pass@host:port"  (tuỳ chọn)
+  GITHUB_RUN_URL            — tự điền bởi workflow
+  GITHUB_REPO               — "owner/repo"  (tự điền bởi workflow)
 """
 
-import os, sys, time, logging, re, json
+import os, sys, time, logging, re, json, tempfile
 from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
 import requests
 from jobspy import scrape_jobs
+
+# Google Drive (optional — chỉ import khi cần)
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaFileUpload
+    GDRIVE_AVAILABLE = True
+except ImportError:
+    GDRIVE_AVAILABLE = False
 
 DEMO_MODE = "--demo" in sys.argv
 
@@ -35,6 +46,10 @@ PROXIES: list[str] = [_proxy_env] if _proxy_env else []
 TEAMS_WEBHOOK_URL  = os.getenv("TEAMS_WEBHOOK_URL", "")
 GITHUB_RUN_URL     = os.getenv("GITHUB_RUN_URL", "")
 GITHUB_REPO        = os.getenv("GITHUB_REPO", "")
+
+# Google Drive
+GDRIVE_SA_JSON     = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")   # JSON string
+GDRIVE_FOLDER_ID   = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")        # Folder ID trên Drive
 
 RESULTS_PER_SEARCH = 50
 DAYS_OLD           = 3
@@ -219,12 +234,18 @@ def _get_apply_method(row) -> str:
 
 def _isna(v) -> bool:
     if v is None: return True
-    try: return pd.isna(v)
+    try: return bool(pd.isna(v))
     except: return False
 
 
 def _resolve_salary_fields(row):
-    """Waterfall: structured → compensation dict → text parse."""
+    """
+    Waterfall lấy salary:
+    1. Cột min_amount / max_amount trực tiếp (jobspy trả về)
+    2. compensation object (jobspy >= 0.19) — hỗ trợ cả dict lẫn object
+    3. Parse text từ các cột salary, salary_text
+    4. Parse text từ 2000 ký tự đầu description
+    """
     intv = _clean_interval(row.get("interval"))
     curr = _clean_currency(row.get("currency"), row.get("location"), row.get("site"))
     src  = row.get("salary_source")
@@ -235,15 +256,22 @@ def _resolve_salary_fields(row):
     if mn is not None or mx is not None:
         return mn, mx, intv, curr, src or "direct_data"
 
-    # 2. compensation dict (jobspy >= 0.19)
+    # 2. compensation — hỗ trợ dict VÀ object (jobspy Compensation dataclass)
     comp = row.get("compensation")
-    if comp and isinstance(comp, dict):
-        mn2 = _to_number(comp.get("min_amount") or comp.get("min"))
-        mx2 = _to_number(comp.get("max_amount") or comp.get("max"))
-        iv2 = _clean_interval(comp.get("interval") or comp.get("pay_period"))
-        cu2 = _clean_currency(comp.get("currency"), row.get("location"), row.get("site"))
+    if comp is not None and not _isna(comp):
+        # Nếu là dict
+        if isinstance(comp, dict):
+            mn2, mx2, iv2, cu2 = _extract_from_comp_dict(comp)
+        else:
+            # Jobspy trả object — thử các attribute phổ biến
+            mn2 = _to_number(getattr(comp, "min_amount", None) or getattr(comp, "min", None))
+            mx2 = _to_number(getattr(comp, "max_amount", None) or getattr(comp, "max", None))
+            iv_raw = getattr(comp, "interval", None) or getattr(comp, "pay_period", None)
+            iv2 = _clean_interval(str(iv_raw) if iv_raw else None)
+            cu_raw = getattr(comp, "currency", None)
+            cu2 = _clean_currency(str(cu_raw) if cu_raw else None, row.get("location"), row.get("site"))
         if mn2 is not None or mx2 is not None:
-            return mn2, mx2, iv2 or intv, cu2 or curr, "compensation_dict"
+            return mn2, mx2, iv2 or intv, cu2 or curr, "compensation_obj"
 
     # 3. Text parse (salary / salary_text / description[:2000])
     for field in ["salary", "salary_text"]:
@@ -258,6 +286,14 @@ def _resolve_salary_fields(row):
         return mn3, mx3, iv3 or intv, cu3 or curr, "desc_parse"
 
     return None, None, intv, curr, src
+
+
+def _extract_from_comp_dict(comp: dict):
+    mn2 = _to_number(comp.get("min_amount") or comp.get("min") or comp.get("minAmount"))
+    mx2 = _to_number(comp.get("max_amount") or comp.get("max") or comp.get("maxAmount"))
+    iv2 = _clean_interval(comp.get("interval") or comp.get("pay_period") or comp.get("payPeriod"))
+    cu2 = _clean_currency(comp.get("currency"), None, None)
+    return mn2, mx2, iv2, cu2
 
 
 def _extract_salary_from_text(value, currency_hint="CAD"):
@@ -404,7 +440,8 @@ def filter_jobs(df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop_duplicates(subset=["job_url"], keep="first")
     log.info(f"Sau dedup URL     : {len(df)} (bỏ {n0 - len(df)})")
 
-    df = df[df["location_str"].apply(lambda l: any(c in l.lower() for c in ALLOWED_CITIES) if l else False)]
+    df = df[df["location_str"].apply(
+        lambda l: any(c in l.lower() for c in ALLOWED_CITIES) if l else False)]
     log.info(f"Sau lọc địa điểm  : {len(df)}")
 
     cutoff = date.today() - timedelta(days=DAYS_OLD)
@@ -421,7 +458,7 @@ def _salary_ok(row) -> bool:
     mn   = row.get("min_amount")
     mx   = row.get("max_amount")
     intv = str(row.get("interval") or "").lower()
-    if _isna(mn) and _isna(mx): return True
+    if _isna(mn) and _isna(mx): return True   # không có lương → giữ lại (C-suite thường không đăng)
     amount = float(mn if not _isna(mn) else mx)
     return amount >= {"yearly":MIN_ANNUAL,"hourly":MIN_HOURLY,
                       "monthly":MIN_MONTHLY,"weekly":MIN_HOURLY*40,
@@ -446,9 +483,62 @@ def save_results(df: pd.DataFrame) -> Path:
     log.info(f"Saved {len(out)} jobs → {OUTPUT_FILE.resolve()}")
     return OUTPUT_FILE
 
+# ─── GOOGLE DRIVE UPLOAD ────────────────────────────────────────────────────
+
+def upload_to_drive(csv_path: Path) -> str | None:
+    """
+    Upload CSV lên Google Drive và trả về link folder.
+    Yêu cầu:
+      - GOOGLE_SERVICE_ACCOUNT_JSON : JSON string của service account
+      - GOOGLE_DRIVE_FOLDER_ID      : ID folder đã share với service account (Editor)
+    """
+    if not GDRIVE_AVAILABLE:
+        log.warning("google-api-python-client chưa cài — bỏ qua Drive upload.")
+        return None
+    if not GDRIVE_SA_JSON or not GDRIVE_FOLDER_ID:
+        log.warning("GOOGLE_SERVICE_ACCOUNT_JSON hoặc GOOGLE_DRIVE_FOLDER_ID chưa cấu hình — bỏ qua.")
+        return None
+
+    try:
+        sa_info = json.loads(GDRIVE_SA_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        service = build("drive", "v3", credentials=creds)
+
+        # Kiểm tra file trùng tên trong folder → xoá nếu có
+        existing = service.files().list(
+            q=f"name='{csv_path.name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed=false",
+            fields="files(id,name)"
+        ).execute().get("files", [])
+        for f in existing:
+            service.files().delete(fileId=f["id"]).execute()
+            log.info(f"Đã xoá file cũ: {f['name']} ({f['id']})")
+
+        # Upload file mới
+        file_meta = {
+            "name": csv_path.name,
+            "parents": [GDRIVE_FOLDER_ID],
+        }
+        media = MediaFileUpload(str(csv_path), mimetype="text/csv", resumable=True)
+        uploaded = service.files().create(
+            body=file_meta, media_body=media, fields="id,name"
+        ).execute()
+
+        file_id = uploaded["id"]
+        log.info(f"✅ Upload thành công: {uploaded['name']} (id={file_id})")
+
+        folder_link = f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}"
+        return folder_link
+
+    except Exception as e:
+        log.error(f"❌ Drive upload lỗi: {e}")
+        return None
+
 # ─── MS TEAMS NOTIFICATION ──────────────────────────────────────────────────
 
-def send_teams_notification(df: pd.DataFrame, csv_path: Path):
+def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: str | None = None):
     if not TEAMS_WEBHOOK_URL:
         log.warning("TEAMS_WEBHOOK_URL chưa cấu hình — bỏ qua.")
         return
@@ -479,9 +569,8 @@ def send_teams_notification(df: pd.DataFrame, csv_path: Path):
             f"{k} ({v})" for k,v in top_kw.items()) + "\n\n"
 
     links = []
-    if GITHUB_REPO:
-        raw_url = f"https://raw.githubusercontent.com/{GITHUB_REPO}/data/{csv_path.name}"
-        links.append(f"[📥 Download CSV]({raw_url})")
+    if drive_folder_url:
+        links.append(f"[📁 Xem folder Google Drive]({drive_folder_url})")
     if GITHUB_RUN_URL:
         links.append(f"[🔗 GitHub Actions Run]({GITHUB_RUN_URL})")
 
@@ -538,7 +627,7 @@ def print_summary(df: pd.DataFrame):
             print(f"    • {kw:<40}: {cnt}")
 
     has_salary = int(df["salary_display"].ne("N/A").sum()) if "salary_display" in df.columns else 0
-    pct = f"{has_salary/len(df)*100:.0f}%"
+    pct = f"{has_salary/len(df)*100:.0f}%" if len(df) > 0 else "0%"
     print(f"\n  Có lương          : {has_salary}  ({pct})")
     print(f"  Không có lương    : {len(df) - has_salary}")
 
@@ -562,23 +651,29 @@ def print_summary(df: pd.DataFrame):
 
 def main():
     print("\n" + "═"*62)
-    print(f"  Vancouver Job Crawler {'[DEMO MODE]' if DEMO_MODE else ''}")
+    print(f"  Vancouver Job Crawler v2 {'[DEMO MODE]' if DEMO_MODE else ''}")
     print(f"  Sites  : {', '.join(SITES)}")
     print(f"  Ngày   : {DAYS_OLD} ngày gần nhất")
     print(f"  Lương  : >= ${MIN_ANNUAL:,}/yr  hoac  ${MIN_HOURLY}/hr")
     print(f"  Proxy  : {'OK ' + str(len(PROXIES)) + ' proxy' if PROXIES else 'chua cau hinh'}")
     print(f"  Teams  : {'OK' if TEAMS_WEBHOOK_URL else 'chua cau hinh'}")
+    print(f"  GDrive : {'OK' if GDRIVE_SA_JSON and GDRIVE_FOLDER_ID else 'chua cau hinh'}")
     print("═"*62 + "\n")
 
     raw_df = make_demo_data() if DEMO_MODE else crawl_jobs()
     if raw_df.empty:
         print_summary(raw_df); return
 
-    norm_df     = normalize(raw_df)
-    filtered_df = filter_jobs(norm_df)
-    csv_path    = save_results(filtered_df)
+    norm_df        = normalize(raw_df)
+    filtered_df    = filter_jobs(norm_df)
+    csv_path       = save_results(filtered_df)
     print_summary(filtered_df)
-    send_teams_notification(filtered_df, csv_path)
+
+    drive_url      = upload_to_drive(csv_path)
+    if drive_url:
+        log.info(f"📁 Drive folder: {drive_url}")
+
+    send_teams_notification(filtered_df, csv_path, drive_folder_url=drive_url)
 
 if __name__ == "__main__":
     main()
