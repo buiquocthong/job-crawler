@@ -46,6 +46,7 @@ PROXIES: list[str] = [_proxy_env] if _proxy_env else []
 TEAMS_WEBHOOK_URL  = os.getenv("TEAMS_WEBHOOK_URL", "")
 GITHUB_RUN_URL     = os.getenv("GITHUB_RUN_URL", "")
 GITHUB_REPO        = os.getenv("GITHUB_REPO", "")
+POWER_AUTOMATE_URL = os.getenv("POWER_AUTOMATE_URL")
 
 # Google Drive
 GDRIVE_SA_JSON     = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")   # JSON string
@@ -583,19 +584,26 @@ def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: 
             f"{table}\n\n"
             f"{'  |  '.join(links)}")
 
+    # payload = {
+    #     "@type": "MessageCard", "@context": "http://schema.org/extensions",
+    #     "themeColor": "0072C6",
+    #     "summary": f"Vancouver Jobs {today_str} — {total} jobs",
+    #     "sections": [{
+    #         "activityTitle":    f"📋 Vancouver Job Crawler — {today_str}",
+    #         "activitySubtitle": f"{total} jobs  |  {has_salary} có lương  |  {total-has_salary} N/A",
+    #         "text": body, "markdown": True,
+    #     }],
+    # }
+    
     payload = {
-        "@type": "MessageCard", "@context": "http://schema.org/extensions",
-        "themeColor": "0072C6",
-        "summary": f"Vancouver Jobs {today_str} — {total} jobs",
-        "sections": [{
-            "activityTitle":    f"📋 Vancouver Job Crawler — {today_str}",
-            "activitySubtitle": f"{total} jobs  |  {has_salary} có lương  |  {total-has_salary} N/A",
-            "text": body, "markdown": True,
-        }],
-    }
+    "text": f"Total jobs: {len(df)}",
+    "drive_url": drive_folder_url or "N/A"
+}
+
+    # requests.post(POWER_AUTOMATE_URL, json=payload)
 
     try:
-        resp = requests.post(TEAMS_WEBHOOK_URL,
+        resp = requests.post(POWER_AUTOMATE_URL,
                              headers={"Content-Type":"application/json"},
                              data=json.dumps(payload), timeout=30)
         if resp.status_code == 200:
@@ -610,7 +618,7 @@ def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: 
 def print_summary(df: pd.DataFrame):
     SEP = "═" * 62
     print(f"\n{SEP}")
-    print(f"  VANCOUVER JOB CRAWLER {'[DEMO]' if DEMO_MODE else ''}")
+    print(f" JOB CRAWLER {'[DEMO]' if DEMO_MODE else ''}")
     print(SEP)
     if df.empty:
         print("  ⚠️  Không có kết quả. Cấu hình JOB_PROXY và chạy lại.")
