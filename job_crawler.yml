@@ -1,0 +1,84 @@
+name: Vancouver Job Crawler
+
+on:
+  schedule:
+    # 7:00 AM PST = 15:00 UTC (tháng 11–3)
+    # 7:00 AM PDT = 14:00 UTC (tháng 3–11)
+    # Dùng 15:00 UTC để khớp 7am PST (mùa đông)
+    - cron: '0 15 * * *'
+  workflow_dispatch:        # Cho phép chạy thủ công từ GitHub UI
+    inputs:
+      demo:
+        description: 'Chạy demo mode (không cần proxy)?'
+        type: boolean
+        default: false
+
+jobs:
+  crawl:
+    name: Crawl & Send to Teams
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      # 1. Checkout nhánh main (code)
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. Setup Python
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # 3. Cài dependencies
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 4. Chạy crawler
+      - name: Run job crawler
+        env:
+          JOB_PROXY:         ${{ secrets.JOB_PROXY }}
+          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          GITHUB_REPO:       ${{ github.repository }}
+          GITHUB_RUN_URL:    ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "${{ inputs.demo }}" == "true" ]; then
+            python vancouver_job_crawler.py --demo
+          else
+            python vancouver_job_crawler.py
+          fi
+
+      # 5. Upload CSV làm GitHub Artifact (có thể download từ Actions page)
+      - name: Upload CSV as Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vancouver-jobs-${{ github.run_id }}
+          path: vancouver_jobs_*.csv
+          retention-days: 30
+
+      # 6. Commit CSV vào nhánh "data" (để có link download trực tiếp)
+      - name: Commit CSV to data branch
+        if: success()
+        run: |
+          CSV_FILE=$(ls vancouver_jobs_*.csv | head -1)
+          echo "CSV file: $CSV_FILE"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Lấy nhánh data (tạo mới nếu chưa có)
+          git fetch origin data 2>/dev/null || true
+          git checkout -B data origin/data 2>/dev/null || git checkout --orphan data
+
+          # Copy file mới vào
+          git checkout main -- vancouver_job_crawler.py 2>/dev/null || true
+          cp "../$CSV_FILE" . 2>/dev/null || true
+          ls vancouver_jobs_*.csv 2>/dev/null && true
+
+          git add vancouver_jobs_*.csv
+          git diff --cached --quiet || git commit -m "chore: jobs report $(date +'%Y-%m-%d') [skip ci]"
+          git push origin data
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
