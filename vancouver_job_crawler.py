@@ -539,79 +539,98 @@ def upload_to_drive(csv_path: Path) -> str | None:
 
 # ─── MS TEAMS NOTIFICATION ──────────────────────────────────────────────────
 
+# def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: str | None = None):
+#     if not TEAMS_WEBHOOK_URL:
+#         log.warning("TEAMS_WEBHOOK_URL chưa cấu hình — bỏ qua.")
+#         return
+
+#     today_str  = date.today().strftime("%d/%m/%Y")
+#     total      = len(df)
+#     has_salary = int(df["salary_display"].ne("N/A").sum()) if "salary_display" in df.columns else 0
+
+#     # Top 10 jobs table
+#     rows_md = []
+#     for _, r in df.head(10).iterrows():
+#         title   = str(r.get("title",""))[:40]
+#         company = str(r.get("company_name",""))[:25]
+#         salary  = str(r.get("salary_display","N/A"))
+#         loc     = str(r.get("location_str",""))[:20]
+#         url     = str(r.get("job_url",""))
+#         link    = f"[{title}]({url})" if url.startswith("http") else title
+#         rows_md.append(f"| {link} | {company} | {loc} | {salary} |")
+
+#     table = ("| Vị trí | Công ty | Địa điểm | Lương |\n"
+#              "|--------|---------|----------|-------|\n"
+#              + "\n".join(rows_md))
+
+#     kw_line = ""
+#     if "search_keyword" in df.columns and total > 0:
+#         top_kw  = df["search_keyword"].value_counts().head(5)
+#         kw_line = "**Top keywords:** " + "  ·  ".join(
+#             f"{k} ({v})" for k,v in top_kw.items()) + "\n\n"
+
+#     links = []
+#     if drive_folder_url:
+#         links.append(f"[📁 Xem folder Google Drive]({drive_folder_url})")
+#     if GITHUB_RUN_URL:
+#         links.append(f"[🔗 GitHub Actions Run]({GITHUB_RUN_URL})")
+
+#     body = (f"## 🏙️ Vancouver Jobs — {today_str}\n\n"
+#             f"**Tổng:** {total} jobs  |  "
+#             f"**Có lương:** {has_salary}  |  "
+#             f"**N/A lương:** {total - has_salary}\n\n"
+#             f"{kw_line}"
+#             f"### Top {min(10,total)} jobs\n\n"
+#             f"{table}\n\n"
+#             f"{'  |  '.join(links)}")
+
+#     # payload = {
+#     #     "@type": "MessageCard", "@context": "http://schema.org/extensions",
+#     #     "themeColor": "0072C6",
+#     #     "summary": f"Vancouver Jobs {today_str} — {total} jobs",
+#     #     "sections": [{
+#     #         "activityTitle":    f"📋 Vancouver Job Crawler — {today_str}",
+#     #         "activitySubtitle": f"{total} jobs  |  {has_salary} có lương  |  {total-has_salary} N/A",
+#     #         "text": body, "markdown": True,
+#     #     }],
+#     # }
+    
+#     payload = {
+#     "text": f"Total jobs: {len(df)}",
+#     "drive_url": drive_folder_url or "N/A"
+# }
+
 def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: str | None = None):
-    if not TEAMS_WEBHOOK_URL:
-        log.warning("TEAMS_WEBHOOK_URL chưa cấu hình — bỏ qua.")
+    if not POWER_AUTOMATE_URL:
+        log.warning("POWER_AUTOMATE_URL chưa cấu hình — bỏ qua.")
         return
 
-    today_str  = date.today().strftime("%d/%m/%Y")
-    total      = len(df)
-    has_salary = int(df["salary_display"].ne("N/A").sum()) if "salary_display" in df.columns else 0
+    today_str = date.today().strftime("%d/%m/%Y")
+    total     = len(df)
 
-    # Top 10 jobs table
-    rows_md = []
-    for _, r in df.head(10).iterrows():
-        title   = str(r.get("title",""))[:40]
-        company = str(r.get("company_name",""))[:25]
-        salary  = str(r.get("salary_display","N/A"))
-        loc     = str(r.get("location_str",""))[:20]
-        url     = str(r.get("job_url",""))
-        link    = f"[{title}]({url})" if url.startswith("http") else title
-        rows_md.append(f"| {link} | {company} | {loc} | {salary} |")
+    message = (
+        f"🏙️ Vancouver Jobs — {today_str}\n"
+        f"✅ Tìm được {total} jobs mới\n"
+        f"📁 Xem danh sách: {drive_folder_url or 'N/A'}"
+    )
 
-    table = ("| Vị trí | Công ty | Địa điểm | Lương |\n"
-             "|--------|---------|----------|-------|\n"
-             + "\n".join(rows_md))
-
-    kw_line = ""
-    if "search_keyword" in df.columns and total > 0:
-        top_kw  = df["search_keyword"].value_counts().head(5)
-        kw_line = "**Top keywords:** " + "  ·  ".join(
-            f"{k} ({v})" for k,v in top_kw.items()) + "\n\n"
-
-    links = []
-    if drive_folder_url:
-        links.append(f"[📁 Xem folder Google Drive]({drive_folder_url})")
-    if GITHUB_RUN_URL:
-        links.append(f"[🔗 GitHub Actions Run]({GITHUB_RUN_URL})")
-
-    body = (f"## 🏙️ Vancouver Jobs — {today_str}\n\n"
-            f"**Tổng:** {total} jobs  |  "
-            f"**Có lương:** {has_salary}  |  "
-            f"**N/A lương:** {total - has_salary}\n\n"
-            f"{kw_line}"
-            f"### Top {min(10,total)} jobs\n\n"
-            f"{table}\n\n"
-            f"{'  |  '.join(links)}")
-
-    # payload = {
-    #     "@type": "MessageCard", "@context": "http://schema.org/extensions",
-    #     "themeColor": "0072C6",
-    #     "summary": f"Vancouver Jobs {today_str} — {total} jobs",
-    #     "sections": [{
-    #         "activityTitle":    f"📋 Vancouver Job Crawler — {today_str}",
-    #         "activitySubtitle": f"{total} jobs  |  {has_salary} có lương  |  {total-has_salary} N/A",
-    #         "text": body, "markdown": True,
-    #     }],
-    # }
-    
     payload = {
-    "text": f"Total jobs: {len(df)}",
-    "drive_url": drive_folder_url or "N/A"
-}
-
-    # requests.post(POWER_AUTOMATE_URL, json=payload)
+        "text": message,
+        "drive_url": drive_folder_url or ""
+    }
 
     try:
         resp = requests.post(POWER_AUTOMATE_URL,
-                             headers={"Content-Type":"application/json"},
-                             data=json.dumps(payload), timeout=30)
-        if resp.status_code == 200:
-            log.info("✅ Đã gửi báo cáo lên MS Teams.")
+                             headers={"Content-Type": "application/json"},
+                             data=json.dumps(payload),
+                             timeout=30)
+        if resp.status_code in (200, 202):
+            log.info("✅ Đã gửi báo cáo vào MS Teams.")
         else:
-            log.error(f"❌ Teams webhook lỗi {resp.status_code}: {resp.text[:300]}")
+            log.error(f"❌ Power Automate lỗi {resp.status_code}: {resp.text[:300]}")
     except Exception as e:
         log.error(f"❌ Lỗi gửi Teams: {e}")
+
 
 # ─── SUMMARY ────────────────────────────────────────────────────────────────
 
