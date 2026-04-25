@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Vancouver Job Crawler  (v2 — Google Drive + Salary Fix)
-========================================================
+Vancouver Job Crawler  (v3 — OAuth2 Google Drive cho Personal Gmail)
+=====================================================================
 Crawl Indeed + Glassdoor: tài chính / data science / C-suite
 Lọc  : Vancouver BC area | min $60k/yr hoặc $30/hr | 3 ngày gần nhất
-Upload: Google Drive (Service Account) → gửi link folder qua MS Teams
+Upload: Google Drive (OAuth2 Refresh Token) → gửi link qua MS Teams / Power Automate
 
 Cách chạy:
   pip install -r requirements.txt
@@ -12,15 +12,33 @@ Cách chạy:
   python3 vancouver_job_crawler.py --demo # Demo không cần proxy/credentials
 
 Biến môi trường (set trong GitHub Secrets):
-  TEAMS_WEBHOOK_URL         — URL webhook kênh Teams
-  GOOGLE_SERVICE_ACCOUNT_JSON — JSON string của Google Service Account
-  GOOGLE_DRIVE_FOLDER_ID    — ID folder Google Drive (share với service account)
+  TEAMS_WEBHOOK_URL         — URL webhook kênh Teams (tuỳ chọn)
+  POWER_AUTOMATE_URL        — URL Power Automate (tuỳ chọn)
+
+  # --- Google Drive OAuth2 (personal Gmail) ---
+  GDRIVE_CLIENT_ID          — OAuth2 Client ID từ Google Cloud Console
+  GDRIVE_CLIENT_SECRET      — OAuth2 Client Secret
+  GDRIVE_REFRESH_TOKEN      — Refresh Token (lấy 1 lần bằng script lấy token bên dưới)
+  GOOGLE_DRIVE_FOLDER_ID    — ID folder trên Drive của bạn (share "Editor" cho OAuth app)
+
   JOB_PROXY                 — "user:pass@host:port"  (tuỳ chọn)
   GITHUB_RUN_URL            — tự điền bởi workflow
   GITHUB_REPO               — "owner/repo"  (tự điền bởi workflow)
+
+═══════════════════════════════════════════════════════════════════
+  HƯỚNG DẪN LẤY OAUTH2 CREDENTIALS (chỉ làm 1 lần)
+═══════════════════════════════════════════════════════════════════
+  1. Vào https://console.cloud.google.com
+  2. APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client IDs
+  3. Application type: Desktop App → đặt tên → Create
+  4. Copy Client ID và Client Secret
+  5. Chạy script lấy token (ở cuối file này):
+       python3 vancouver_job_crawler.py --get-token
+  6. Dán refresh_token vào GitHub Secret "GDRIVE_REFRESH_TOKEN"
+═══════════════════════════════════════════════════════════════════
 """
 
-import os, sys, time, logging, re, json, tempfile
+import os, sys, time, logging, re, json, tempfile, webbrowser
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -29,16 +47,19 @@ import requests
 from jobspy import scrape_jobs
 import base64
 
-# Google Drive (optional — chỉ import khi cần)
+# Google Drive
 try:
-    from google.oauth2 import service_account
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request as GoogleRequest
     from googleapiclient.discovery import build
     from googleapiclient.http import MediaFileUpload
+    from googleapiclient.errors import HttpError
     GDRIVE_AVAILABLE = True
 except ImportError:
     GDRIVE_AVAILABLE = False
 
-DEMO_MODE = "--demo" in sys.argv
+DEMO_MODE      = "--demo"      in sys.argv
+GET_TOKEN_MODE = "--get-token" in sys.argv
 
 # ─── CẤU HÌNH ───────────────────────────────────────────────────────────────
 
@@ -47,11 +68,13 @@ PROXIES: list[str] = [_proxy_env] if _proxy_env else []
 TEAMS_WEBHOOK_URL  = os.getenv("TEAMS_WEBHOOK_URL", "")
 GITHUB_RUN_URL     = os.getenv("GITHUB_RUN_URL", "")
 GITHUB_REPO        = os.getenv("GITHUB_REPO", "")
-POWER_AUTOMATE_URL = os.getenv("POWER_AUTOMATE_URL")
+POWER_AUTOMATE_URL = os.getenv("POWER_AUTOMATE_URL", "")
 
-# Google Drive
-GDRIVE_SA_JSON     = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")   # JSON string
-GDRIVE_FOLDER_ID   = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")        # Folder ID trên Drive
+# Google Drive — OAuth2 (personal Gmail)
+GDRIVE_CLIENT_ID     = os.getenv("GDRIVE_CLIENT_ID", "")
+GDRIVE_CLIENT_SECRET = os.getenv("GDRIVE_CLIENT_SECRET", "")
+GDRIVE_REFRESH_TOKEN = os.getenv("GDRIVE_REFRESH_TOKEN", "")
+GDRIVE_FOLDER_ID     = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
 
 RESULTS_PER_SEARCH = 50
 DAYS_OLD           = 3
@@ -241,31 +264,20 @@ def _isna(v) -> bool:
 
 
 def _resolve_salary_fields(row):
-    """
-    Waterfall lấy salary:
-    1. Cột min_amount / max_amount trực tiếp (jobspy trả về)
-    2. compensation object (jobspy >= 0.19) — hỗ trợ cả dict lẫn object
-    3. Parse text từ các cột salary, salary_text
-    4. Parse text từ 2000 ký tự đầu description
-    """
     intv = _clean_interval(row.get("interval"))
     curr = _clean_currency(row.get("currency"), row.get("location"), row.get("site"))
     src  = row.get("salary_source")
 
-    # 1. Structured columns
     mn = _to_number(row.get("min_amount"))
     mx = _to_number(row.get("max_amount"))
     if mn is not None or mx is not None:
         return mn, mx, intv, curr, src or "direct_data"
 
-    # 2. compensation — hỗ trợ dict VÀ object (jobspy Compensation dataclass)
     comp = row.get("compensation")
     if comp is not None and not _isna(comp):
-        # Nếu là dict
         if isinstance(comp, dict):
             mn2, mx2, iv2, cu2 = _extract_from_comp_dict(comp)
         else:
-            # Jobspy trả object — thử các attribute phổ biến
             mn2 = _to_number(getattr(comp, "min_amount", None) or getattr(comp, "min", None))
             mx2 = _to_number(getattr(comp, "max_amount", None) or getattr(comp, "max", None))
             iv_raw = getattr(comp, "interval", None) or getattr(comp, "pay_period", None)
@@ -275,7 +287,6 @@ def _resolve_salary_fields(row):
         if mn2 is not None or mx2 is not None:
             return mn2, mx2, iv2 or intv, cu2 or curr, "compensation_obj"
 
-    # 3. Text parse (salary / salary_text / description[:2000])
     for field in ["salary", "salary_text"]:
         parsed = _extract_salary_from_text(row.get(field), curr)
         if parsed:
@@ -304,7 +315,6 @@ def _extract_salary_from_text(value, currency_hint="CAD"):
     text = (text.replace("\u2013","-").replace("\u2014","-")
                 .replace("\u2212","-").replace("\xa0"," "))
 
-    # Pattern 1 — Range: $80,000 - $100,000 /yr  OR  $80K - $100K a year
     p1 = (r"(?P<currency>CAD|USD|C\$|US\$|\$)\s*"
           r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*"
           r"[-\u2013to ]+\s*(?:CAD|USD|C\$|US\$|\$)?\s*"
@@ -314,7 +324,6 @@ def _extract_salary_from_text(value, currency_hint="CAD"):
           r"per\s*month|a\s*month|monthly|"
           r"per\s*week|a\s*week|weekly|per\s*day|a\s*day|daily)?")
 
-    # Pattern 2 — Single: $80,000/yr  $45/hr
     p2 = (r"(?P<currency>CAD|USD|C\$|US\$|\$)\s*"
           r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*[/\s]*"
           r"(?P<interval>per\s*year|a\s*year|yr|yearly|annually|"
@@ -322,13 +331,11 @@ def _extract_salary_from_text(value, currency_hint="CAD"):
           r"per\s*month|a\s*month|monthly|"
           r"per\s*week|a\s*week|weekly|per\s*day|a\s*day|daily)")
 
-    # Pattern 3 — "Up to $X a year"
     p3 = (r"[Uu]p\s+to\s+(?P<currency>CAD|USD|C\$|US\$|\$)\s*"
           r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*"
           r"(?P<interval>per\s*year|a\s*year|yr|yearly|annually|"
           r"per\s*hour|an\s*hour|hr|hourly|per\s*month|a\s*month|monthly)?")
 
-    # Pattern 4 — Numbers only: 80,000 – 120,000  (implied yearly)
     p4 = r"(?<!\d)(?P<min>\d{2,3},\d{3})\s*[-\u2013]\s*(?P<max>\d{2,3},\d{3})(?!\d)"
 
     for i, pattern in enumerate([p1, p2, p3, p4]):
@@ -460,7 +467,7 @@ def _salary_ok(row) -> bool:
     mn   = row.get("min_amount")
     mx   = row.get("max_amount")
     intv = str(row.get("interval") or "").lower()
-    if _isna(mn) and _isna(mx): return True   # không có lương → giữ lại (C-suite thường không đăng)
+    if _isna(mn) and _isna(mx): return True
     amount = float(mn if not _isna(mn) else mx)
     return amount >= {"yearly":MIN_ANNUAL,"hourly":MIN_HOURLY,
                       "monthly":MIN_MONTHLY,"weekly":MIN_HOURLY*40,
@@ -485,129 +492,235 @@ def save_results(df: pd.DataFrame) -> Path:
     log.info(f"Saved {len(out)} jobs → {OUTPUT_FILE.resolve()}")
     return OUTPUT_FILE
 
-# ─── GOOGLE DRIVE UPLOAD ────────────────────────────────────────────────────
+# ─── GOOGLE DRIVE UPLOAD (OAuth2 — Personal Gmail) ───────────────────────────
+#
+#  Tại sao dùng OAuth2 thay vì Service Account?
+#  ─────────────────────────────────────────────
+#  Service Account không có storage quota (0 GB).
+#  Khi upload lên "My Drive" được share → Drive API coi file thuộc về SA → 403.
+#  Shared Drive fix được vấn đề này NHƯNG chỉ có trên Google Workspace, không có trên
+#  personal Gmail.
+#
+#  OAuth2 Refresh Token = upload dưới danh nghĩa chính tài khoản Gmail của bạn
+#  → file thuộc về bạn → dùng 15 GB quota cá nhân → không bao giờ bị 403 quota.
+#
+#  Secrets cần thiết:
+#    GDRIVE_CLIENT_ID      — từ Google Cloud Console (OAuth2 Desktop App)
+#    GDRIVE_CLIENT_SECRET  — từ Google Cloud Console
+#    GDRIVE_REFRESH_TOKEN  — chạy: python3 vancouver_job_crawler.py --get-token
+#    GOOGLE_DRIVE_FOLDER_ID — ID folder trên Drive của bạn
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _build_oauth2_service():
+    """
+    Tạo Google Drive service dùng OAuth2 credentials (personal Gmail).
+    Tự động refresh access token khi hết hạn — chỉ cần refresh_token 1 lần.
+    """
+    creds = Credentials(
+        token=None,                              # access token — sẽ tự refresh
+        refresh_token=GDRIVE_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GDRIVE_CLIENT_ID,
+        client_secret=GDRIVE_CLIENT_SECRET,
+        scopes=["https://www.googleapis.com/auth/drive"],
+    )
+    # Refresh ngay để kiểm tra credentials hợp lệ
+    if not creds.valid:
+        creds.refresh(GoogleRequest())
+    return build("drive", "v3", credentials=creds)
+
+
+def _delete_existing_files(service, folder_id: str, filename: str):
+    """Xoá file cũ trùng tên trong folder (tránh duplicate)."""
+    result = service.files().list(
+        q=f"name='{filename}' and '{folder_id}' in parents and trashed=false",
+        fields="files(id,name)"
+    ).execute()
+    for f in result.get("files", []):
+        service.files().delete(fileId=f["id"]).execute()
+        log.info(f"🗑️  Đã xoá file cũ: {f['name']} (id={f['id']})")
+
+
+def _verify_upload(service, file_id: str, expected_name: str,
+                   expected_folder_id: str) -> bool:
+    """Xác nhận file đã upload đúng chỗ, đúng tên, không bị trash."""
+    try:
+        meta = service.files().get(
+            fileId=file_id,
+            fields="id,name,parents,trashed,size"
+        ).execute()
+        checks = {
+            "Tên file khớp" : meta.get("name") == expected_name,
+            "Không bị trash": not meta.get("trashed", True),
+            "Đúng folder"   : expected_folder_id in meta.get("parents", []),
+            "Có dung lượng" : int(meta.get("size", 0)) > 0,
+        }
+        for label, ok in checks.items():
+            log.info(f"  Verify [{'✅' if ok else '❌'}] {label}")
+        return all(checks.values())
+    except HttpError as e:
+        log.error(f"❌ Không verify được file {file_id}: {e}")
+        return False
+
 
 def upload_to_drive(csv_path: Path) -> str | None:
     """
-    Upload CSV lên Google Drive và trả về link folder.
-    Yêu cầu:
-      - GOOGLE_SERVICE_ACCOUNT_JSON : JSON string của service account
-      - GOOGLE_DRIVE_FOLDER_ID      : ID folder đã share với service account (Editor)
+    Upload CSV lên Google Drive personal (OAuth2).
+    Trả về link folder nếu thành công, None nếu lỗi.
     """
     if not GDRIVE_AVAILABLE:
-        log.warning("google-api-python-client chưa cài — bỏ qua Drive upload.")
+        log.warning("⚠️  google-api-python-client chưa cài — bỏ qua Drive upload.")
         return None
-    if not GDRIVE_SA_JSON or not GDRIVE_FOLDER_ID:
-        log.warning("GOOGLE_SERVICE_ACCOUNT_JSON hoặc GOOGLE_DRIVE_FOLDER_ID chưa cấu hình — bỏ qua.")
+
+    # Kiểm tra đủ credentials
+    missing = [name for name, val in [
+        ("GDRIVE_CLIENT_ID",     GDRIVE_CLIENT_ID),
+        ("GDRIVE_CLIENT_SECRET", GDRIVE_CLIENT_SECRET),
+        ("GDRIVE_REFRESH_TOKEN", GDRIVE_REFRESH_TOKEN),
+        ("GOOGLE_DRIVE_FOLDER_ID", GDRIVE_FOLDER_ID),
+    ] if not val]
+
+    if missing:
+        log.warning(f"⚠️  Thiếu secrets: {', '.join(missing)} — bỏ qua Drive upload.")
+        log.warning("    Chạy: python3 vancouver_job_crawler.py --get-token để lấy token.")
         return None
 
     try:
-        # sa_info = json.loads(GDRIVE_SA_JSON)
+        log.info("🔐 Khởi tạo Google Drive service (OAuth2 personal)...")
+        service = _build_oauth2_service()
+        log.info("✅ Xác thực OAuth2 thành công.")
 
-        try:
-            decoded = base64.b64decode(GDRIVE_SA_JSON).decode("utf-8")
-            sa_info = json.loads(decoded)
-        except Exception:
-            sa_info = json.loads(GDRIVE_SA_JSON)
-        creds = service_account.Credentials.from_service_account_info(
-            sa_info,
-            scopes=["https://www.googleapis.com/auth/drive"]
-        )
-        service = build("drive", "v3", credentials=creds)
+        # Xoá file cũ trùng tên
+        log.info(f"🔍 Kiểm tra file trùng tên '{csv_path.name}'...")
+        _delete_existing_files(service, GDRIVE_FOLDER_ID, csv_path.name)
 
-        # Kiểm tra file trùng tên trong folder → xoá nếu có
-        existing = service.files().list(
-            q=f"name='{csv_path.name}' and '{GDRIVE_FOLDER_ID}' in parents and trashed=false",
-            fields="files(id,name)"
-        ).execute().get("files", [])
-        for f in existing:
-            service.files().delete(fileId=f["id"]).execute()
-            log.info(f"Đã xoá file cũ: {f['name']} ({f['id']})")
+        # Upload
+        file_meta = {"name": csv_path.name, "parents": [GDRIVE_FOLDER_ID]}
+        media     = MediaFileUpload(str(csv_path), mimetype="text/csv", resumable=True)
+        log.info(f"⬆️  Đang upload '{csv_path.name}' ({csv_path.stat().st_size:,} bytes)...")
 
-        # Upload file mới
-        file_meta = {
-            "name": csv_path.name,
-            "parents": [GDRIVE_FOLDER_ID],
-        }
-        media = MediaFileUpload(str(csv_path), mimetype="text/csv", resumable=True)
         uploaded = service.files().create(
-            body=file_meta, media_body=media, fields="id,name"
+            body=file_meta,
+            media_body=media,
+            fields="id,name,size"
         ).execute()
 
         file_id = uploaded["id"]
         log.info(f"✅ Upload thành công: {uploaded['name']} (id={file_id})")
 
-        folder_link = f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}"
-        return folder_link
+        # Verify
+        log.info("🔎 Verifying upload...")
+        _verify_upload(service, file_id, csv_path.name, GDRIVE_FOLDER_ID)
 
-    except Exception as e:
-        log.error(f"❌ Drive upload lỗi: {e}")
+        return f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}"
+
+    except HttpError as e:
+        error_str = str(e)
+        if "storageQuotaExceeded" in error_str:
+            log.error("❌ 403 storageQuotaExceeded — Folder ID có thể sai hoặc "
+                      "token chưa được authorize đúng scope. Chạy --get-token lại.")
+        elif "invalid_grant" in error_str or "Token has been expired" in error_str:
+            log.error("❌ Refresh token hết hạn hoặc bị revoke.\n"
+                      "   Fix: Chạy lại python3 vancouver_job_crawler.py --get-token "
+                      "và cập nhật GDRIVE_REFRESH_TOKEN trong GitHub Secrets.")
+        elif "404" in error_str or "notFound" in error_str:
+            log.error("❌ 404 Không tìm thấy folder. Kiểm tra GOOGLE_DRIVE_FOLDER_ID.")
+        elif "403" in error_str:
+            log.error("❌ 403 Không có quyền. "
+                      "Đảm bảo bạn đã share folder cho tài khoản Gmail đang dùng OAuth2.")
+        else:
+            log.error(f"❌ Drive upload lỗi: {e}")
         return None
 
-# ─── MS TEAMS NOTIFICATION ──────────────────────────────────────────────────
+    except Exception as e:
+        if "invalid_grant" in str(e):
+            log.error("❌ OAuth2 refresh token không hợp lệ. "
+                      "Chạy lại --get-token và cập nhật secret.")
+        else:
+            log.error(f"❌ Drive upload lỗi không mong đợi: {e}")
+        return None
 
-# def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: str | None = None):
-#     if not TEAMS_WEBHOOK_URL:
-#         log.warning("TEAMS_WEBHOOK_URL chưa cấu hình — bỏ qua.")
-#         return
+# ─── LẤY OAUTH2 TOKEN (chạy 1 lần) ─────────────────────────────────────────
 
-#     today_str  = date.today().strftime("%d/%m/%Y")
-#     total      = len(df)
-#     has_salary = int(df["salary_display"].ne("N/A").sum()) if "salary_display" in df.columns else 0
+def get_oauth2_token():
+    """
+    Chạy: python3 vancouver_job_crawler.py --get-token
 
-#     # Top 10 jobs table
-#     rows_md = []
-#     for _, r in df.head(10).iterrows():
-#         title   = str(r.get("title",""))[:40]
-#         company = str(r.get("company_name",""))[:25]
-#         salary  = str(r.get("salary_display","N/A"))
-#         loc     = str(r.get("location_str",""))[:20]
-#         url     = str(r.get("job_url",""))
-#         link    = f"[{title}]({url})" if url.startswith("http") else title
-#         rows_md.append(f"| {link} | {company} | {loc} | {salary} |")
+    Hướng dẫn:
+      1. Vào https://console.cloud.google.com → chọn project
+      2. APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client IDs
+      3. Application type: Desktop App → Create
+      4. Copy Client ID và Client Secret vào biến dưới (hoặc set env var)
+      5. Chạy script → browser mở ra → đăng nhập Gmail → cho phép
+      6. Copy refresh_token → dán vào GitHub Secret "GDRIVE_REFRESH_TOKEN"
+    """
+    client_id     = GDRIVE_CLIENT_ID     or input("Nhập GDRIVE_CLIENT_ID: ").strip()
+    client_secret = GDRIVE_CLIENT_SECRET or input("Nhập GDRIVE_CLIENT_SECRET: ").strip()
 
-#     table = ("| Vị trí | Công ty | Địa điểm | Lương |\n"
-#              "|--------|---------|----------|-------|\n"
-#              + "\n".join(rows_md))
+    # Bước 1: Tạo URL xác thực
+    auth_url = (
+        "https://accounts.google.com/o/oauth2/v2/auth"
+        f"?client_id={client_id}"
+        "&redirect_uri=urn:ietf:wg:oauth:2.0:oob"
+        "&response_type=code"
+        "&scope=https://www.googleapis.com/auth/drive"
+        "&access_type=offline"
+        "&prompt=consent"           # Bắt buộc để luôn trả về refresh_token
+    )
 
-#     kw_line = ""
-#     if "search_keyword" in df.columns and total > 0:
-#         top_kw  = df["search_keyword"].value_counts().head(5)
-#         kw_line = "**Top keywords:** " + "  ·  ".join(
-#             f"{k} ({v})" for k,v in top_kw.items()) + "\n\n"
+    print("\n" + "═"*62)
+    print("  BƯỚC 1: Mở URL sau trong browser và đăng nhập Gmail:")
+    print("═"*62)
+    print(f"\n{auth_url}\n")
+    try:
+        webbrowser.open(auth_url)
+        print("  (Browser đã tự mở — nếu không thì copy URL trên)\n")
+    except Exception:
+        print("  (Copy URL trên và mở thủ công)\n")
 
-#     links = []
-#     if drive_folder_url:
-#         links.append(f"[📁 Xem folder Google Drive]({drive_folder_url})")
-#     if GITHUB_RUN_URL:
-#         links.append(f"[🔗 GitHub Actions Run]({GITHUB_RUN_URL})")
+    # Bước 2: Nhập authorization code
+    print("  BƯỚC 2: Sau khi đăng nhập và cho phép, Google sẽ hiển thị")
+    print("  một đoạn code. Copy và dán vào đây:\n")
+    auth_code = input("  Authorization code: ").strip()
 
-#     body = (f"## 🏙️ Vancouver Jobs — {today_str}\n\n"
-#             f"**Tổng:** {total} jobs  |  "
-#             f"**Có lương:** {has_salary}  |  "
-#             f"**N/A lương:** {total - has_salary}\n\n"
-#             f"{kw_line}"
-#             f"### Top {min(10,total)} jobs\n\n"
-#             f"{table}\n\n"
-#             f"{'  |  '.join(links)}")
+    # Bước 3: Đổi code lấy token
+    resp = requests.post(
+        "https://oauth2.googleapis.com/token",
+        data={
+            "code"         : auth_code,
+            "client_id"    : client_id,
+            "client_secret": client_secret,
+            "redirect_uri" : "urn:ietf:wg:oauth:2.0:oob",
+            "grant_type"   : "authorization_code",
+        }
+    )
 
-#     # payload = {
-#     #     "@type": "MessageCard", "@context": "http://schema.org/extensions",
-#     #     "themeColor": "0072C6",
-#     #     "summary": f"Vancouver Jobs {today_str} — {total} jobs",
-#     #     "sections": [{
-#     #         "activityTitle":    f"📋 Vancouver Job Crawler — {today_str}",
-#     #         "activitySubtitle": f"{total} jobs  |  {has_salary} có lương  |  {total-has_salary} N/A",
-#     #         "text": body, "markdown": True,
-#     #     }],
-#     # }
-    
-#     payload = {
-#     "text": f"Total jobs: {len(df)}",
-#     "drive_url": drive_folder_url or "N/A"
-# }
+    if resp.status_code != 200:
+        print(f"\n❌ Lỗi lấy token: {resp.text}")
+        return
 
-def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: str | None = None):
+    token_data = resp.json()
+    refresh_token = token_data.get("refresh_token")
+
+    if not refresh_token:
+        print("\n❌ Không nhận được refresh_token. "
+              "Hãy chắc chắn đã thêm '&prompt=consent' vào URL.")
+        return
+
+    print("\n" + "═"*62)
+    print("  ✅ Lấy token thành công!")
+    print("═"*62)
+    print(f"\n  REFRESH TOKEN:\n  {refresh_token}\n")
+    print("  BƯỚC TIẾP THEO:")
+    print("  1. Copy refresh token trên")
+    print("  2. GitHub repo → Settings → Secrets → Actions")
+    print("  3. Thêm secret: GDRIVE_REFRESH_TOKEN = <paste ở đây>")
+    print("  4. Cũng thêm: GDRIVE_CLIENT_ID và GDRIVE_CLIENT_SECRET\n")
+
+# ─── MS TEAMS / POWER AUTOMATE NOTIFICATION ─────────────────────────────────
+
+def send_teams_notification(df: pd.DataFrame, csv_path: Path,
+                            drive_folder_url: str | None = None):
     if not POWER_AUTOMATE_URL:
         log.warning("POWER_AUTOMATE_URL chưa cấu hình — bỏ qua.")
         return
@@ -622,7 +735,7 @@ def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: 
     )
 
     payload = {
-        "text": message,
+        "text"     : message,
         "drive_url": drive_folder_url or ""
     }
 
@@ -637,7 +750,6 @@ def send_teams_notification(df: pd.DataFrame, csv_path: Path, drive_folder_url: 
             log.error(f"❌ Power Automate lỗi {resp.status_code}: {resp.text[:300]}")
     except Exception as e:
         log.error(f"❌ Lỗi gửi Teams: {e}")
-
 
 # ─── SUMMARY ────────────────────────────────────────────────────────────────
 
@@ -681,33 +793,50 @@ def print_summary(df: pd.DataFrame):
     print(f"\n  File CSV: {OUTPUT_FILE.resolve()}")
     print(SEP + "\n")
 
-# ─── MAIN ───────────────────────────────────────────────────────────────────
+# ─── MAIN ────────────────────────────────────────────────────────────────────
 
 def main():
+    # Mode đặc biệt: lấy OAuth2 token
+    if GET_TOKEN_MODE:
+        get_oauth2_token()
+        return
+
     print("\n" + "═"*62)
-    print(f"  Vancouver Job Crawler v2 {'[DEMO MODE]' if DEMO_MODE else ''}")
+    print(f"  Vancouver Job Crawler v3 {'[DEMO MODE]' if DEMO_MODE else ''}")
     print(f"  Sites  : {', '.join(SITES)}")
     print(f"  Ngày   : {DAYS_OLD} ngày gần nhất")
-    print(f"  Lương  : >= ${MIN_ANNUAL:,}/yr  hoac  ${MIN_HOURLY}/hr")
-    print(f"  Proxy  : {'OK ' + str(len(PROXIES)) + ' proxy' if PROXIES else 'chua cau hinh'}")
-    print(f"  Teams  : {'OK' if TEAMS_WEBHOOK_URL else 'chua cau hinh'}")
-    print(f"  GDrive : {'OK' if GDRIVE_SA_JSON and GDRIVE_FOLDER_ID else 'chua cau hinh'}")
+    print(f"  Lương  : >= ${MIN_ANNUAL:,}/yr  hoặc  ${MIN_HOURLY}/hr")
+    print(f"  Proxy  : {'OK ' + str(len(PROXIES)) + ' proxy' if PROXIES else 'chưa cấu hình'}")
+    print(f"  P.Auto : {'OK' if POWER_AUTOMATE_URL else 'chưa cấu hình'}")
+
+    # Kiểm tra Drive credentials
+    drive_ready = all([GDRIVE_CLIENT_ID, GDRIVE_CLIENT_SECRET,
+                       GDRIVE_REFRESH_TOKEN, GDRIVE_FOLDER_ID])
+    if drive_ready:
+        print("  GDrive : ✅ OAuth2 personal Gmail")
+    else:
+        missing = [n for n,v in [
+            ("CLIENT_ID",GDRIVE_CLIENT_ID),("CLIENT_SECRET",GDRIVE_CLIENT_SECRET),
+            ("REFRESH_TOKEN",GDRIVE_REFRESH_TOKEN),("FOLDER_ID",GDRIVE_FOLDER_ID)
+        ] if not v]
+        print(f"  GDrive : ⚠️  Thiếu: {', '.join(missing)}")
     print("═"*62 + "\n")
 
-    raw_df = make_demo_data() if DEMO_MODE else crawl_jobs()
+    raw_df      = make_demo_data() if DEMO_MODE else crawl_jobs()
     if raw_df.empty:
         print_summary(raw_df); return
 
-    norm_df        = normalize(raw_df)
-    filtered_df    = filter_jobs(norm_df)
-    csv_path       = save_results(filtered_df)
+    norm_df     = normalize(raw_df)
+    filtered_df = filter_jobs(norm_df)
+    csv_path    = save_results(filtered_df)
     print_summary(filtered_df)
 
-    drive_url      = upload_to_drive(csv_path)
+    drive_url   = upload_to_drive(csv_path)
     if drive_url:
         log.info(f"📁 Drive folder: {drive_url}")
 
     send_teams_notification(filtered_df, csv_path, drive_folder_url=drive_url)
+
 
 if __name__ == "__main__":
     main()
