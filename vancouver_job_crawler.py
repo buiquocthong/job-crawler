@@ -199,8 +199,11 @@ def crawl_jobs() -> pd.DataFrame:
                     if df is not None and not df.empty:
                         df["search_keyword"] = keyword
                         df["search_group"]   = group_name
+                        # Debug: log salary coverage của batch này
+                        has_sal = int(df["min_amount"].notna().sum()) if "min_amount" in df.columns else 0
+                        has_desc = int(df["description"].notna().sum()) if "description" in df.columns else 0
+                        log.info(f"  → {len(df)} jobs | salary_direct={has_sal} | desc={has_desc}")
                         all_frames.append(df)
-                        log.info(f"  → {len(df)} jobs thô")
                     else:
                         log.warning("  → 0 jobs. Cấu hình JOB_PROXY nếu thấy 403.")
                 except Exception as e:
@@ -213,6 +216,20 @@ def crawl_jobs() -> pd.DataFrame:
 
     raw = pd.concat(all_frames, ignore_index=True)
     log.info(f"Tổng thô (có trùng): {len(raw)}")
+
+    # Lưu raw data (bao gồm description) để có thể re-process sau
+    raw_path = Path(f"vancouver_jobs_{date.today()}_raw.csv")
+    raw_cols  = [c for c in raw.columns if c != "description"]  # description riêng
+    raw[raw_cols].to_csv(raw_path, index=False, encoding="utf-8-sig")
+
+    # Lưu description riêng (có thể rất lớn)
+    if "description" in raw.columns:
+        desc_path = Path(f"vancouver_jobs_{date.today()}_desc.jsonl")
+        with open(desc_path, "w", encoding="utf-8") as f:
+            for _, row in raw[["job_url","description"]].iterrows():
+                f.write(json.dumps({"url": row["job_url"], "desc": row["description"] or ""}) + "\n")
+        log.info(f"Saved descriptions → {desc_path}")
+
     return raw
 
 # ─── NORMALIZE & SALARY FIX ─────────────────────────────────────────────────
@@ -234,6 +251,16 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     df["apply_method"]   = df.apply(_get_apply_method, axis=1)
     df["salary_display"] = df.apply(_format_salary, axis=1)
     df["date_posted"]    = pd.to_datetime(df["date_posted"], errors="coerce").dt.date
+
+    # Log salary coverage để debug
+    total = len(df)
+    has_sal = int(df["min_amount"].notna().sum())
+    by_src  = df["salary_source"].value_counts().to_dict()
+    log.info(f"Salary coverage sau normalize: {has_sal}/{total} ({has_sal/total*100:.0f}%)")
+    log.info(f"  Theo nguồn: {by_src}")
+    desc_null = int(df["description"].isna().sum())
+    log.info(f"  Description null/empty: {desc_null}/{total} "
+             f"({'⚠️ jobspy không lấy được description → salary parse bị hạn chế' if desc_null > total*0.5 else 'OK'})")
     return df
 
 
@@ -281,8 +308,15 @@ def _resolve_salary_fields(row):
             mn2 = _to_number(getattr(comp, "min_amount", None) or getattr(comp, "min", None))
             mx2 = _to_number(getattr(comp, "max_amount", None) or getattr(comp, "max", None))
             iv_raw = getattr(comp, "interval", None) or getattr(comp, "pay_period", None)
+            # BUG FIX: jobspy trả CompensationInterval Enum, cần lấy .value
+            # str(CompensationInterval.YEARLY) = "CompensationInterval.YEARLY" → sai
+            # CompensationInterval.YEARLY.value = "yearly" → đúng
+            if iv_raw is not None and hasattr(iv_raw, "value"):
+                iv_raw = iv_raw.value
             iv2 = _clean_interval(str(iv_raw) if iv_raw else None)
             cu_raw = getattr(comp, "currency", None)
+            if cu_raw is not None and hasattr(cu_raw, "value"):
+                cu_raw = cu_raw.value
             cu2 = _clean_currency(str(cu_raw) if cu_raw else None, row.get("location"), row.get("site"))
         if mn2 is not None or mx2 is not None:
             return mn2, mx2, iv2 or intv, cu2 or curr, "compensation_obj"
@@ -307,7 +341,10 @@ def _resolve_salary_fields(row):
 def _extract_from_comp_dict(comp: dict):
     mn2 = _to_number(comp.get("min_amount") or comp.get("min") or comp.get("minAmount"))
     mx2 = _to_number(comp.get("max_amount") or comp.get("max") or comp.get("maxAmount"))
-    iv2 = _clean_interval(comp.get("interval") or comp.get("pay_period") or comp.get("payPeriod"))
+    iv_raw = comp.get("interval") or comp.get("pay_period") or comp.get("payPeriod")
+    if iv_raw is not None and hasattr(iv_raw, "value"):
+        iv_raw = iv_raw.value
+    iv2 = _clean_interval(iv_raw)
     cu2 = _clean_currency(comp.get("currency"), None, None)
     return mn2, mx2, iv2, cu2
 
@@ -488,19 +525,30 @@ def _format_salary(row) -> str:
 #  Các selector được test với Indeed CA và Glassdoor CA (2025-2026).
 # ─────────────────────────────────────────────────────────────────────────────
 
-ENRICH_TIMEOUT    = 12   # giây timeout mỗi request
-ENRICH_MAX_JOBS   = 60   # tối đa bao nhiêu job N/A sẽ được enrich
-ENRICH_WORKERS    = 5    # concurrent threads
-ENRICH_SLEEP      = 1.0  # sleep giữa các batch (giây)
+ENRICH_TIMEOUT    = 15   # giây timeout mỗi request
+ENRICH_MAX_JOBS   = 80   # tối đa bao nhiêu job N/A sẽ được enrich
+ENRICH_WORKERS    = 4    # concurrent threads (thấp hơn để tránh rate limit)
+ENRICH_SLEEP      = 1.5  # sleep giữa các request (giây)
+
+# Build proxy dict từ JOB_PROXY env (dùng lại cho enrich)
+def _build_proxies() -> dict | None:
+    if not _proxy_env: return None
+    proxy_url = f"http://{_proxy_env}" if not _proxy_env.startswith("http") else _proxy_env
+    return {"http": proxy_url, "https": proxy_url}
 
 _ENRICH_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-CA,en;q=0.9",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-CA,en;q=0.9,fr-CA;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "navigate",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 # Selector patterns để extract salary text từ HTML (Indeed + Glassdoor)
@@ -521,18 +569,26 @@ def _fetch_salary_from_url(url: str, currency_hint: str = "CAD"):
     """Fetch một URL và parse salary. Return (mn, mx, interval, currency, src) hoặc None."""
     if not url or not url.startswith("http"):
         return None
+    proxies = _build_proxies()
     try:
-        resp = requests.get(url, headers=_ENRICH_HEADERS,
+        resp = requests.get(url, headers=_ENRICH_HEADERS, proxies=proxies,
                             timeout=ENRICH_TIMEOUT, allow_redirects=True)
         if resp.status_code != 200:
+            log.debug(f"HTTP {resp.status_code} for {url[:60]}")
             return None
         html = resp.text
 
-        # Thử JSON-LD trước (chính xác nhất)
-        jld_match = re.search(
+        # --- Indeed specific: parse mosaic-data JSON (chứa salary không qua JS) ---
+        if "indeed.com" in url:
+            result = _parse_indeed_mosaic_json(html, currency_hint)
+            if result:
+                return result
+
+        # Thử JSON-LD (schema.org/JobPosting) — chuẩn nhất
+        for jld_match in re.finditer(
             r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
-            html, re.DOTALL | re.IGNORECASE)
-        if jld_match:
+            html, re.DOTALL | re.IGNORECASE
+        ):
             try:
                 data = json.loads(jld_match.group(1))
                 sal_text = _extract_salary_from_jsonld(data)
@@ -552,17 +608,59 @@ def _fetch_salary_from_url(url: str, currency_hint: str = "CAD"):
                 if parsed:
                     return (*parsed, "page_html")
 
-        # Fallback: tìm salary pattern trong toàn bộ text của trang
-        text_only = re.sub(r"<[^>]+>", " ", html)
+        # Fallback: tìm salary pattern trong text visible đầu trang (8KB)
+        # Chỉ lấy phần đầu trang vì salary thường xuất hiện sớm
+        text_only = re.sub(r"<[^>]+>", " ", html[:20000])
         text_only = re.sub(r"\s+", " ", text_only)
-        parsed = _extract_salary_from_text(text_only[:8000], currency_hint)
+        parsed = _extract_salary_from_text(text_only, currency_hint)
         if parsed:
             return (*parsed, "page_text")
 
     except requests.exceptions.Timeout:
         log.debug(f"Timeout fetching {url[:60]}")
+    except requests.exceptions.ProxyError as e:
+        log.debug(f"Proxy error {url[:60]}: {e}")
     except Exception as e:
         log.debug(f"Fetch error {url[:60]}: {e}")
+    return None
+
+
+def _parse_indeed_mosaic_json(html: str, currency_hint: str = "CAD"):
+    """
+    Indeed nhúng salary vào JSON trong window._initialData hoặc mosaic-data.
+    Đây là nguồn chính xác nhất, không qua JS rendering.
+    """
+    # Pattern 1: window._initialData = {...}
+    for pat in [
+        r'window\._initialData\s*=\s*(\{.*?\});\s*(?:window|</script>)',
+        r'"salaryInfo"\s*:\s*(\{[^}]{10,300}\})',
+        r'"compensation"\s*:\s*(\{[^}]{10,400}\})',
+        r'<script[^>]*id=["\']mosaic-data["\'][^>]*>(.*?)</script>',
+    ]:
+        m = re.search(pat, html, re.DOTALL | re.IGNORECASE)
+        if not m: continue
+        try:
+            # Extract salary-related keys từ JSON fragment
+            frag = m.group(1)
+            # Look for salary patterns trong JSON string
+            salary_pattern = re.search(
+                r'"(?:formattedSalary|salaryRange|salaryMin|salary|baseSalary)"\s*:\s*"([^"]{5,100})"',
+                frag, re.IGNORECASE
+            )
+            if salary_pattern:
+                parsed = _extract_salary_from_text(salary_pattern.group(1), currency_hint)
+                if parsed: return (*parsed, "page_mosaic")
+
+            # Try numeric min/max
+            min_m = re.search(r'"(?:salaryMin|minSalary|minAmount)"\s*:\s*([\d.]+)', frag)
+            max_m = re.search(r'"(?:salaryMax|maxSalary|maxAmount)"\s*:\s*([\d.]+)', frag)
+            if min_m:
+                mn = float(min_m.group(1))
+                mx = float(max_m.group(1)) if max_m else None
+                intv = "yearly" if mn > 1000 else "hourly"
+                return (int(mn), int(mx) if mx else None, intv, currency_hint, "page_mosaic")
+        except Exception:
+            continue
     return None
 
 
@@ -607,7 +705,8 @@ def _extract_salary_from_jsonld(data) -> str | None:
 def enrich_salaries(df: pd.DataFrame) -> pd.DataFrame:
     """
     Với các job salary_display == 'N/A', fetch job page để lấy salary.
-    Cập nhật in-place và trả về df đã cập nhật.
+    Ưu tiên job_url_direct (trang company, ít bị block hơn) → fallback job_url (Indeed).
+    Dùng proxy nếu JOB_PROXY được cấu hình.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -617,17 +716,26 @@ def enrich_salaries(df: pd.DataFrame) -> pd.DataFrame:
         log.info("Không có job N/A cần enrich.")
         return df
 
-    log.info(f"🔍 Enriching salary cho {len(na_df)} jobs (max {ENRICH_MAX_JOBS})...")
+    proxy_info = f"proxy={_proxy_env[:20]}..." if _proxy_env else "no proxy"
+    log.info(f"🔍 Enriching salary cho {len(na_df)} jobs ({proxy_info})...")
     enriched = 0
 
     def _process_row(idx_row):
         idx, row = idx_row
         curr = str(row.get("currency") or "CAD")
-        # Ưu tiên job_url_direct (trang company) → fallback job_url (Indeed/Glassdoor listing)
+        urls_tried = []
+
+        # Ưu tiên: job_url_direct (company ATS) → job_url (Indeed/Glassdoor)
         for url in [row.get("job_url_direct"), row.get("job_url")]:
-            result = _fetch_salary_from_url(str(url or ""), curr)
+            url_str = str(url or "").strip()
+            if not url_str or not url_str.startswith("http"):
+                continue
+            urls_tried.append(url_str[:50])
+            time.sleep(ENRICH_SLEEP)
+            result = _fetch_salary_from_url(url_str, curr)
             if result:
                 return idx, result
+        log.debug(f"Enrich failed: {row.get('title','?')[:30]} | tried: {urls_tried}")
         return idx, None
 
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as executor:
@@ -646,12 +754,16 @@ def enrich_salaries(df: pd.DataFrame) -> pd.DataFrame:
                 df.at[idx, "salary_source"] = src
                 df.at[idx, "salary_display"] = _format_salary(df.loc[idx])
                 enriched += 1
-            if done % 10 == 0:
-                log.info(f"  Enrich: {done}/{len(na_df)} xử lý, {enriched} tìm được lương")
-            time.sleep(ENRICH_SLEEP / ENRICH_WORKERS)
+                log.info(f"  ✅ [{done}/{len(na_df)}] {df.at[idx,'title'][:30]} → "
+                         f"{df.at[idx,'salary_display']} ({src})")
+            elif done % 10 == 0:
+                log.info(f"  ⏳ [{done}/{len(na_df)}] enriched={enriched}")
 
-    log.info(f"✅ Enrich xong: +{enriched} jobs có lương "
-             f"({enriched/len(na_df)*100:.0f}% của {len(na_df)} jobs N/A)")
+    pct = f"{enriched/len(na_df)*100:.0f}%" if na_df.shape[0] > 0 else "0%"
+    log.info(f"✅ Enrich xong: +{enriched}/{len(na_df)} jobs có lương ({pct})")
+    if enriched == 0 and not _proxy_env:
+        log.warning("⚠️  Enrich = 0. Indeed thường chặn request không có proxy.")
+        log.warning("   Set biến môi trường JOB_PROXY=user:pass@host:port để bypass.")
     return df
 
 # ─── LỌC ────────────────────────────────────────────────────────────────────
