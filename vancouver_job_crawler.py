@@ -287,13 +287,16 @@ def _resolve_salary_fields(row):
         if mn2 is not None or mx2 is not None:
             return mn2, mx2, iv2 or intv, cu2 or curr, "compensation_obj"
 
+    # Thứ tự ưu tiên parse: salary field → salary_text → description (đầy đủ, không cắt 2000)
     for field in ["salary", "salary_text"]:
         parsed = _extract_salary_from_text(row.get(field), curr)
         if parsed:
             mn3,mx3,iv3,cu3 = parsed
             return mn3, mx3, iv3 or intv, cu3 or curr, "text_parse"
 
-    parsed = _extract_salary_from_text((row.get("description") or "")[:2000], curr)
+    # Parse toàn bộ description (không cắt ngắn còn 2000 ký tự)
+    desc = row.get("description") or ""
+    parsed = _extract_salary_from_text(desc, curr)
     if parsed:
         mn3,mx3,iv3,cu3 = parsed
         return mn3, mx3, iv3 or intv, cu3 or curr, "desc_parse"
@@ -309,57 +312,88 @@ def _extract_from_comp_dict(comp: dict):
     return mn2, mx2, iv2, cu2
 
 
+# Interval pattern (dùng chung nhiều regex)
+_INTV_PAT = (
+    r"(?P<interval>"
+    r"per\s*year|a\s*year|/\s*year|/\s*yr|yr\.?|yearly|annually|annual|"
+    r"per\s*hour|an\s*hour|/\s*hour|/\s*hr|hr\.?|hourly|"
+    r"per\s*month|a\s*month|/\s*month|/\s*mo|monthly|"
+    r"per\s*week|a\s*week|/\s*week|/\s*wk|weekly|"
+    r"per\s*day|a\s*day|/\s*day|daily"
+    r")"
+)
+
 def _extract_salary_from_text(value, currency_hint="CAD"):
     text = _to_text(value)
     if not text: return None
     text = (text.replace("\u2013","-").replace("\u2014","-")
-                .replace("\u2212","-").replace("\xa0"," "))
+                .replace("\u2212","-").replace("\xa0"," ")
+                .replace("\u2019","'"))
 
-    p1 = (r"(?P<currency>CAD|USD|C\$|US\$|\$)\s*"
-          r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*"
-          r"[-\u2013to ]+\s*(?:CAD|USD|C\$|US\$|\$)?\s*"
-          r"(?P<max>\d[\d,]*(?:\.\d+)?)\s*(?P<max_k>[kK]?)\s*"
-          r"(?P<interval>per\s*year|a\s*year|yr|yearly|annually|"
-          r"per\s*hour|an\s*hour|hr|hourly|"
-          r"per\s*month|a\s*month|monthly|"
-          r"per\s*week|a\s*week|weekly|per\s*day|a\s*day|daily)?")
+    _CUR = r"(?:CAD|USD|C\$|US\$|\$)"
 
-    p2 = (r"(?P<currency>CAD|USD|C\$|US\$|\$)\s*"
-          r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*[/\s]*"
-          r"(?P<interval>per\s*year|a\s*year|yr|yearly|annually|"
-          r"per\s*hour|an\s*hour|hr|hourly|"
-          r"per\s*month|a\s*month|monthly|"
-          r"per\s*week|a\s*week|weekly|per\s*day|a\s*day|daily)")
+    # P1: Range với currency prefix — $80,000 - $100,000 a year | $45/hr - $55/hr
+    p1 = (
+        r"(?P<currency>" + _CUR + r")\s*"
+        r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*"
+        r"(?:[-\u2013/]|to|–)\s*"
+        r"(?:" + _CUR + r")?\s*"
+        r"(?P<max>\d[\d,]*(?:\.\d+)?)\s*(?P<max_k>[kK]?)\s*" + _INTV_PAT + r"?"
+    )
 
-    p3 = (r"[Uu]p\s+to\s+(?P<currency>CAD|USD|C\$|US\$|\$)\s*"
-          r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*"
-          r"(?P<interval>per\s*year|a\s*year|yr|yearly|annually|"
-          r"per\s*hour|an\s*hour|hr|hourly|per\s*month|a\s*month|monthly)?")
+    # P2: Single value với currency — $75,000/year | $35/hr | $120k annually
+    p2 = (
+        r"(?P<currency>" + _CUR + r")\s*"
+        r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*" + _INTV_PAT
+    )
 
-    p4 = r"(?<!\d)(?P<min>\d{2,3},\d{3})\s*[-\u2013]\s*(?P<max>\d{2,3},\d{3})(?!\d)"
+    # P3: "From $60,000 a year" | "Up to $90,000 annually"
+    p3 = (
+        r"(?:from|up\s+to|starting\s+at|minimum|at\s+least)\s+"
+        r"(?P<currency>" + _CUR + r")\s*"
+        r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*" + _INTV_PAT + r"?"
+    )
 
-    for i, pattern in enumerate([p1, p2, p3, p4]):
+    # P4: Plain number range "70,000 to 90,000 per year" (no $ prefix)
+    p4 = (
+        r"(?<!\d)(?P<min>\d{2,3},\d{3}(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*"
+        r"(?:[-\u2013]|to)\s*"
+        r"(?P<max>\d{2,3},\d{3}(?:\.\d+)?)\s*(?P<max_k>[kK]?)\s*" + _INTV_PAT + r"?"
+    )
+
+    # P5: Salary label trước — "Salary: 90,000 - 120,000" hoặc "Compensation: $80K-$100K"
+    p5 = (
+        r"(?:salary|compensation|pay|wage|remuneration|earnings)[:\s]+\s*"
+        r"(?P<currency>" + _CUR + r")?\s*"
+        r"(?P<min>\d[\d,]*(?:\.\d+)?)\s*(?P<min_k>[kK]?)\s*"
+        r"(?:[-\u2013]|to)?\s*"
+        r"(?:" + _CUR + r")?\s*"
+        r"(?P<max>\d[\d,]*(?:\.\d+)?)?\s*(?P<max_k>[kK]?)\s*" + _INTV_PAT + r"?"
+    )
+
+    for i, pattern in enumerate([p1, p2, p3, p4, p5]):
         m = re.search(pattern, text, flags=re.IGNORECASE)
         if not m: continue
         gd = m.groupdict()
         interval = _normalize_interval_text(gd.get("interval") or "")
         currency = _normalize_currency_text(gd.get("currency") or "") or currency_hint
 
-        if i == 3:
-            mn = _parse_amount(gd.get("min"), "")
-            mx = _parse_amount(gd.get("max"), "")
-            interval = interval or "yearly"
-        elif gd.get("max"):
-            mn = _parse_amount(gd.get("min"), gd.get("min_k",""))
-            mx = _parse_amount(gd.get("max"), gd.get("max_k",""))
-        else:
-            mn = _parse_amount(gd.get("min"), gd.get("min_k",""))
-            mx = None
+        mn = _parse_amount(gd.get("min"), gd.get("min_k",""))
+        mx = _parse_amount(gd.get("max"), gd.get("max_k","")) if gd.get("max") else None
 
-        if mn and mn > 0:
-            if mn < 300 and not interval: interval = "hourly"
-            elif mn >= 1000 and not interval: interval = "yearly"
-            return mn, mx, interval, currency
+        if not mn or mn <= 0: continue
+
+        # Heuristic tự động đoán interval nếu thiếu
+        if not interval:
+            if mn < 300:    interval = "hourly"
+            elif mn < 1000: interval = "monthly"
+            else:           interval = "yearly"
+
+        # Sanity check: loại bỏ số phone / zip code
+        if mn > 0 and mx and mx / mn > 10: continue   # range quá rộng → sai
+        if mn > 500_000: continue                      # số vô lý
+
+        return mn, mx, interval, currency
 
     return None
 
@@ -392,12 +426,16 @@ def _parse_amount(raw, suffix=""):
 
 
 def _normalize_interval_text(text):
-    lbl = str(text or "").strip().lower().replace(" ","")
-    return {"peryear":"yearly","ayear":"yearly","yr":"yearly","yearly":"yearly","annually":"yearly",
-            "perhour":"hourly","anhour":"hourly","hr":"hourly","hourly":"hourly",
-            "permonth":"monthly","amonth":"monthly","monthly":"monthly",
-            "perweek":"weekly","aweek":"weekly","weekly":"weekly",
-            "perday":"daily","aday":"daily","daily":"daily"}.get(lbl)
+    lbl = str(text or "").strip().lower().replace(" ","").replace("/","")
+    return {
+        "peryear":"yearly","ayear":"yearly","year":"yearly","yr":"yearly","yr.":"yearly",
+        "yearly":"yearly","annually":"yearly","annual":"yearly",
+        "perhour":"hourly","anhour":"hourly","hour":"hourly","hr":"hourly","hr.":"hourly",
+        "hourly":"hourly",
+        "permonth":"monthly","amonth":"monthly","month":"monthly","mo":"monthly","monthly":"monthly",
+        "perweek":"weekly","aweek":"weekly","week":"weekly","wk":"weekly","weekly":"weekly",
+        "perday":"daily","aday":"daily","day":"daily","daily":"daily",
+    }.get(lbl)
 
 
 def _normalize_currency_text(text):
@@ -439,6 +477,182 @@ def _format_salary(row) -> str:
              "weekly":"/wk","daily":"/day"}.get(intv.lower(),"")
     est   = " (est.)" if "parse" in src else ""
     return f"{curr} {' - '.join(parts)}{lbl}{est}"
+
+
+# ─── SALARY ENRICHMENT — Fetch job page để lấy salary ───────────────────────
+#
+#  Với các job vẫn còn N/A sau normalize(), module này fetch trực tiếp
+#  trang job (ưu tiên job_url_direct, fallback job_url) và parse salary
+#  từ HTML. Chạy với max_workers=6 để nhanh, có retry và timeout an toàn.
+#
+#  Các selector được test với Indeed CA và Glassdoor CA (2025-2026).
+# ─────────────────────────────────────────────────────────────────────────────
+
+ENRICH_TIMEOUT    = 12   # giây timeout mỗi request
+ENRICH_MAX_JOBS   = 60   # tối đa bao nhiêu job N/A sẽ được enrich
+ENRICH_WORKERS    = 5    # concurrent threads
+ENRICH_SLEEP      = 1.0  # sleep giữa các batch (giây)
+
+_ENRICH_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-CA,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+# Selector patterns để extract salary text từ HTML (Indeed + Glassdoor)
+_HTML_SALARY_SELECTORS = [
+    # Indeed: salary widget trên đầu trang
+    r'(?:data-testid=["\']salaryInfoAndJobType["\'][^>]*>)(.*?)(?=<)',
+    r'(?:class=["\'][^"\']*salary[^"\']*["\'][^>]*>)\s*([^<]{5,80})',
+    r'(?:aria-label=["\']Salary["\'][^>]*>)\s*([^<]{5,80})',
+    # Glassdoor: salary section
+    r'(?:data-test=["\']salary-estimate["\'][^>]*>)\s*([^<]{5,80})',
+    r'(?:class=["\'][^"\']*SalaryEstimate[^"\']*["\'][^>]*>)\s*([^<]{5,80})',
+    # JSON-LD structured data (Indeed, LinkedIn, nhiều ATS)
+    r'"baseSalary"\s*:\s*\{[^}]*"value"\s*:\s*\{[^}]*"minValue"\s*:\s*([\d.]+)',
+    r'"salary"\s*:\s*"([^"]{5,100})"',
+]
+
+def _fetch_salary_from_url(url: str, currency_hint: str = "CAD"):
+    """Fetch một URL và parse salary. Return (mn, mx, interval, currency, src) hoặc None."""
+    if not url or not url.startswith("http"):
+        return None
+    try:
+        resp = requests.get(url, headers=_ENRICH_HEADERS,
+                            timeout=ENRICH_TIMEOUT, allow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        html = resp.text
+
+        # Thử JSON-LD trước (chính xác nhất)
+        jld_match = re.search(
+            r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+            html, re.DOTALL | re.IGNORECASE)
+        if jld_match:
+            try:
+                data = json.loads(jld_match.group(1))
+                sal_text = _extract_salary_from_jsonld(data)
+                if sal_text:
+                    parsed = _extract_salary_from_text(sal_text, currency_hint)
+                    if parsed:
+                        return (*parsed, "page_jsonld")
+            except Exception:
+                pass
+
+        # Thử HTML selectors
+        for sel in _HTML_SALARY_SELECTORS:
+            m = re.search(sel, html, re.IGNORECASE | re.DOTALL)
+            if m:
+                candidate = re.sub(r"<[^>]+>", " ", m.group(1)).strip()
+                parsed = _extract_salary_from_text(candidate, currency_hint)
+                if parsed:
+                    return (*parsed, "page_html")
+
+        # Fallback: tìm salary pattern trong toàn bộ text của trang
+        text_only = re.sub(r"<[^>]+>", " ", html)
+        text_only = re.sub(r"\s+", " ", text_only)
+        parsed = _extract_salary_from_text(text_only[:8000], currency_hint)
+        if parsed:
+            return (*parsed, "page_text")
+
+    except requests.exceptions.Timeout:
+        log.debug(f"Timeout fetching {url[:60]}")
+    except Exception as e:
+        log.debug(f"Fetch error {url[:60]}: {e}")
+    return None
+
+
+def _extract_salary_from_jsonld(data) -> str | None:
+    """Trích salary string từ JSON-LD object (schema.org/JobPosting)."""
+    if isinstance(data, list):
+        for item in data:
+            r = _extract_salary_from_jsonld(item)
+            if r: return r
+        return None
+    if not isinstance(data, dict): return None
+
+    # schema.org baseSalary
+    bs = data.get("baseSalary") or data.get("estimatedSalary")
+    if bs:
+        if isinstance(bs, dict):
+            val = bs.get("value") or {}
+            if isinstance(val, dict):
+                mn = val.get("minValue","")
+                mx = val.get("maxValue","")
+                unit = val.get("unitText","")
+                if mn or mx:
+                    return f"${mn} - ${mx} {unit}".strip()
+            elif isinstance(val, (int, float, str)):
+                unit = bs.get("unitText","")
+                return f"${val} {unit}".strip()
+        elif isinstance(bs, str):
+            return bs
+
+    # Tìm đệ quy trong các key khác
+    for key in ["jobBenefits", "description"]:
+        v = data.get(key)
+        if isinstance(v, str) and len(v) > 0:
+            parsed = _extract_salary_from_text(v[:3000], "CAD")
+            if parsed:
+                mn, mx, intv, curr = parsed
+                label = {"yearly":"per year","hourly":"per hour","monthly":"per month"}.get(intv,"")
+                return f"${mn} - ${mx} {label}".strip() if mx else f"${mn} {label}".strip()
+    return None
+
+
+def enrich_salaries(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Với các job salary_display == 'N/A', fetch job page để lấy salary.
+    Cập nhật in-place và trả về df đã cập nhật.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    mask = df["salary_display"] == "N/A"
+    na_df = df[mask].head(ENRICH_MAX_JOBS)
+    if na_df.empty:
+        log.info("Không có job N/A cần enrich.")
+        return df
+
+    log.info(f"🔍 Enriching salary cho {len(na_df)} jobs (max {ENRICH_MAX_JOBS})...")
+    enriched = 0
+
+    def _process_row(idx_row):
+        idx, row = idx_row
+        curr = str(row.get("currency") or "CAD")
+        # Ưu tiên job_url_direct (trang company) → fallback job_url (Indeed/Glassdoor listing)
+        for url in [row.get("job_url_direct"), row.get("job_url")]:
+            result = _fetch_salary_from_url(str(url or ""), curr)
+            if result:
+                return idx, result
+        return idx, None
+
+    with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as executor:
+        futures = {executor.submit(_process_row, (idx, row)): idx
+                   for idx, row in na_df.iterrows()}
+        done = 0
+        for future in as_completed(futures):
+            done += 1
+            idx, result = future.result()
+            if result:
+                mn, mx, intv, curr, src = result
+                df.at[idx, "min_amount"]    = mn
+                df.at[idx, "max_amount"]    = mx
+                df.at[idx, "interval"]      = intv
+                df.at[idx, "currency"]      = curr
+                df.at[idx, "salary_source"] = src
+                df.at[idx, "salary_display"] = _format_salary(df.loc[idx])
+                enriched += 1
+            if done % 10 == 0:
+                log.info(f"  Enrich: {done}/{len(na_df)} xử lý, {enriched} tìm được lương")
+            time.sleep(ENRICH_SLEEP / ENRICH_WORKERS)
+
+    log.info(f"✅ Enrich xong: +{enriched} jobs có lương "
+             f"({enriched/len(na_df)*100:.0f}% của {len(na_df)} jobs N/A)")
+    return df
 
 # ─── LỌC ────────────────────────────────────────────────────────────────────
 
@@ -595,8 +809,11 @@ def upload_to_drive(csv_path: Path) -> str | None:
         _delete_existing_files(service, GDRIVE_FOLDER_ID, csv_path.name)
 
         # Upload
+        suffix   = csv_path.suffix.lower()
+        mimetype = ("application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet" if suffix == ".xlsx" else "text/csv")
         file_meta = {"name": csv_path.name, "parents": [GDRIVE_FOLDER_ID]}
-        media     = MediaFileUpload(str(csv_path), mimetype="text/csv", resumable=True)
+        media     = MediaFileUpload(str(csv_path), mimetype=mimetype, resumable=True)
         log.info(f"⬆️  Đang upload '{csv_path.name}' ({csv_path.stat().st_size:,} bytes)...")
 
         uploaded = service.files().create(
@@ -828,14 +1045,95 @@ def main():
 
     norm_df     = normalize(raw_df)
     filtered_df = filter_jobs(norm_df)
-    csv_path    = save_results(filtered_df)
+
+    # Enrich salary cho các job còn N/A (chỉ chế độ thực, không demo)
+    if not DEMO_MODE:
+        filtered_df = enrich_salaries(filtered_df)
+        # Recompute salary_display sau enrich
+        filtered_df["salary_display"] = filtered_df.apply(_format_salary, axis=1)
+
+    csv_path  = save_results(filtered_df)
+    xlsx_path = _save_excel(filtered_df)
     print_summary(filtered_df)
 
-    drive_url   = upload_to_drive(csv_path)
+    # Upload cả CSV và XLSX lên Drive
+    drive_url = upload_to_drive(csv_path)
+    if xlsx_path and drive_url:
+        upload_to_drive(xlsx_path)
     if drive_url:
         log.info(f"📁 Drive folder: {drive_url}")
 
     send_teams_notification(filtered_df, csv_path, drive_folder_url=drive_url)
+
+
+# ─── XUẤT EXCEL ─────────────────────────────────────────────────────────────
+
+def _save_excel(df: pd.DataFrame) -> Path | None:
+    """Xuất DataFrame ra .xlsx cùng tên với OUTPUT_FILE nhưng đuôi .xlsx."""
+    try:
+        import openpyxl
+        from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        log.warning("openpyxl chưa cài — bỏ qua xuất Excel. pip install openpyxl")
+        return None
+
+    xlsx_path = OUTPUT_FILE.with_suffix(".xlsx")
+    cols = [c for c in OUTPUT_COLS if c in df.columns]
+    out  = df[cols].copy()
+    if "min_amount" in out.columns:
+        out = out.sort_values(["min_amount","date_posted"],
+                              ascending=[False,False], na_position="last")
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Vancouver Jobs"
+
+    # Header style
+    hdr_fill = PatternFill("solid", fgColor="1F4E79")
+    hdr_font = Font(bold=True, color="FFFFFF", size=11)
+    thin     = Side(border_style="thin", color="CCCCCC")
+    bdr      = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for ci, col in enumerate(cols, 1):
+        cell = ws.cell(row=1, column=ci, value=col)
+        cell.fill = hdr_fill
+        cell.font = hdr_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = bdr
+
+    # Data rows — highlight N/A salary in light red
+    na_fill  = PatternFill("solid", fgColor="FFE0E0")
+    sal_col  = cols.index("salary_display") + 1 if "salary_display" in cols else None
+
+    for ri, row_data in enumerate(out.itertuples(index=False), 2):
+        is_na = sal_col and str(getattr(row_data, "salary_display", "")) == "N/A"
+        for ci, val in enumerate(row_data, 1):
+            cell = ws.cell(row=ri, column=ci, value=val)
+            cell.border = bdr
+            cell.alignment = Alignment(vertical="center", wrap_text=False)
+            if is_na and ci == sal_col:
+                cell.fill = na_fill
+
+    # Column widths
+    col_widths = {
+        "title": 36, "company_name": 24, "location_str": 22,
+        "salary_display": 30, "min_amount": 12, "max_amount": 12,
+        "interval": 10, "currency": 9, "salary_source": 18,
+        "apply_method": 24, "date_posted": 13, "job_url": 50,
+        "job_url_direct": 50, "site": 10, "search_keyword": 28,
+        "search_group": 16, "is_remote": 9, "company_industry": 26, "job_type": 12,
+    }
+    for ci, col in enumerate(cols, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = col_widths.get(col, 16)
+
+    ws.row_dimensions[1].height = 30
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+    wb.save(xlsx_path)
+    log.info(f"Saved Excel → {xlsx_path.resolve()}")
+    return xlsx_path
 
 
 if __name__ == "__main__":
