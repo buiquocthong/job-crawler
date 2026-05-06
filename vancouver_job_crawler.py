@@ -967,7 +967,7 @@ def upload_to_drive(csv_path: Path) -> str | None:
                       "Đảm bảo bạn đã share folder cho tài khoản Gmail đang dùng OAuth2.")
         else:
             log.error(f"❌ Drive upload lỗi: {e}")
-        return None
+        return None, None
 
     except Exception as e:
         if "invalid_grant" in str(e):
