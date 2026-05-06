@@ -52,6 +52,7 @@ jobs:
           GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           GOOGLE_DRIVE_FOLDER_ID: ${{ secrets.GOOGLE_DRIVE_FOLDER_ID }}
           JOB_PROXY: ${{ secrets.JOB_PROXY }}
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
           GITHUB_RUN_URL: >-
             https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GITHUB_REPO: ${{ github.repository }}
