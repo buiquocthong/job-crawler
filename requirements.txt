@@ -2,6 +2,7 @@
 
 # Job scraping
 python-jobspy>=0.19.0
+requests
 
 # Data
 pandas>=2.0.0

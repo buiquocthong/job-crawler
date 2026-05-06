@@ -565,18 +565,44 @@ _HTML_SALARY_SELECTORS = [
     r'"salary"\s*:\s*"([^"]{5,100})"',
 ]
 
+# Dùng scraper api
+SCRAPER_API_KEY = os.getenv("SCRAPER_API_KEY", "")
+
+def fetch_with_scraperapi(url: str):
+    if not SCRAPER_API_KEY:
+        raise ValueError("Missing SCRAPER_API_KEY")
+
+    payload = {
+        "api_key": SCRAPER_API_KEY,
+        "url": url,
+        "render": "true"  # 👈 quan trọng cho site dùng JS
+    }
+
+    scraper_url = "http://api.scraperapi.com/?" + urllib.parse.urlencode(payload)
+
+    resp = requests.get(scraper_url, timeout=30)
+
+    if resp.status_code != 200:
+        print("ScraperAPI error:", resp.status_code)
+        return None
+
+    return resp.text
+
 def _fetch_salary_from_url(url: str, currency_hint: str = "CAD"):
     """Fetch một URL và parse salary. Return (mn, mx, interval, currency, src) hoặc None."""
     if not url or not url.startswith("http"):
         return None
     proxies = _build_proxies()
     try:
-        resp = requests.get(url, headers=_ENRICH_HEADERS, proxies=proxies,
-                            timeout=ENRICH_TIMEOUT, allow_redirects=True)
-        if resp.status_code != 200:
-            log.debug(f"HTTP {resp.status_code} for {url[:60]}")
+        # resp = requests.get(url, headers=_ENRICH_HEADERS, proxies=proxies,
+        #                     timeout=ENRICH_TIMEOUT, allow_redirects=True)
+        # if resp.status_code != 200:
+        #     log.debug(f"HTTP {resp.status_code} for {url[:60]}")
+        #     return None
+        # html = resp.text
+        html = fetch_with_scraperapi(url)
+        if not html:
             return None
-        html = resp.text
 
         # --- Indeed specific: parse mosaic-data JSON (chứa salary không qua JS) ---
         if "indeed.com" in url:
@@ -1181,21 +1207,21 @@ def send_teams_notification(df: pd.DataFrame, csv_path: Path,
                     "type": "FactSet",
                     "facts": [
                         {"title": "Tổng jobs:", "value": str(total)},
-                        {"title": "Có lương:", "value": f"{has_salary}/{total}"},
-                        {"title": "Nguồn:", "value": "Indeed + Glassdoor"},
-                        {"title": "File:", "value": csv_path.name.replace(".csv", ".xlsx")},
+                        # {"title": "Có lương:", "value": f"{has_salary}/{total}"},
+                        {"title": "Nguồn:", "value": "Indeed"},
+                        # {"title": "File:", "value": csv_path.name.replace(".csv", ".xlsx")},
                     ]
                 }
             ],
             "actions": [
                 {
                     "type": "Action.OpenUrl",
-                    "title": "📊 Tải Excel",
+                    "title": "Mở File",
                     "url": download_url
                 },
                 {
                     "type": "Action.OpenUrl",
-                    "title": "📁 Mở Drive",
+                    "title": "Mở Drive Folder",
                     "url": drive_folder_url or download_url
                 }
             ] if download_url else []
