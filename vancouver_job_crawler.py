@@ -1109,85 +1109,117 @@ def send_teams_notification(df: pd.DataFrame, csv_path: Path,
     download_url = xlsx_file_url or drive_folder_url or ""
 
     # ── Gửi qua TEAMS_WEBHOOK_URL (Adaptive Card trực tiếp) ──
-    teams_webhook = os.getenv("TEAMS_WEBHOOK_URL", "")
-    if teams_webhook:
-        adaptive_card = {
-            "type": "message",
-            "attachments": [{
-                "contentType": "application/vnd.microsoft.card.adaptive",
-                "content": {
-                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                    "type": "AdaptiveCard",
-                    "version": "1.4",
-                    "body": [
-                        {
-                            "type": "TextBlock",
-                            "text": f"Vancouver Jobs — {today_str}",
-                            "weight": "Bolder",
-                            "size": "Medium",
-                            "color": "Accent"
-                        },
-                        {
-                            "type": "FactSet",
-                            "facts": [
-                                {"title": "Tổng jobs tìm được:", "value": str(total)},
-                                {"title": "Có thông tin lương:", "value": f"{has_salary} / {total}"},
-                                {"title": "Nguồn:", "value": "Indeed CA + Glassdoor CA"},
-                                {"title": "File:", "value": csv_path.name.replace(".csv", ".xlsx")},
-                            ]
-                        }
-                    ],
-                    "actions": [
-                        {
-                            "type": "Action.OpenUrl",
-                            "title": "Tải file Excel hôm nay",
-                            "url": download_url
-                        },
-                        {
-                            "type": "Action.OpenUrl",
-                            "title": "Mở folder Drive",
-                            "url": drive_folder_url or download_url
-                        }
-                    ] if download_url else []
-                }
-            }]
-        }
-        try:
-            resp = requests.post(teams_webhook,
-                                 headers={"Content-Type": "application/json"},
-                                 data=json.dumps(adaptive_card),
-                                 timeout=30)
-            if resp.status_code in (200, 202):
-                log.info("✅ Đã gửi Adaptive Card vào Teams (webhook).")
-            else:
-                log.error(f"❌ Teams webhook lỗi {resp.status_code}: {resp.text[:200]}")
-        except Exception as e:
-            log.error(f"❌ Lỗi Teams webhook: {e}")
+    # teams_webhook = os.getenv("TEAMS_WEBHOOK_URL", "")
+    # if teams_webhook:
+    #     adaptive_card = {
+    #         "type": "message",
+    #         "attachments": [{
+    #             "contentType": "application/vnd.microsoft.card.adaptive",
+    #             "content": {
+    #                 "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    #                 "type": "AdaptiveCard",
+    #                 "version": "1.4",
+    #                 "body": [
+    #                     {
+    #                         "type": "TextBlock",
+    #                         "text": f"Vancouver Jobs — {today_str}",
+    #                         "weight": "Bolder",
+    #                         "size": "Medium",
+    #                         "color": "Accent"
+    #                     },
+    #                     {
+    #                         "type": "FactSet",
+    #                         "facts": [
+    #                             {"title": "Tổng jobs tìm được:", "value": str(total)},
+    #                             {"title": "Có thông tin lương:", "value": f"{has_salary} / {total}"},
+    #                             {"title": "Nguồn:", "value": "Indeed CA + Glassdoor CA"},
+    #                             {"title": "File:", "value": csv_path.name.replace(".csv", ".xlsx")},
+    #                         ]
+    #                     }
+    #                 ],
+    #                 "actions": [
+    #                     {
+    #                         "type": "Action.OpenUrl",
+    #                         "title": "Tải file Excel hôm nay",
+    #                         "url": download_url
+    #                     },
+    #                     {
+    #                         "type": "Action.OpenUrl",
+    #                         "title": "Mở folder Drive",
+    #                         "url": drive_folder_url or download_url
+    #                     }
+    #                 ] if download_url else []
+    #             }
+    #         }]
+    #     }
+    #     try:
+    #         resp = requests.post(teams_webhook,
+    #                              headers={"Content-Type": "application/json"},
+    #                              data=json.dumps(adaptive_card),
+    #                              timeout=30)
+    #         if resp.status_code in (200, 202):
+    #             log.info("✅ Đã gửi Adaptive Card vào Teams (webhook).")
+    #         else:
+    #             log.error(f"❌ Teams webhook lỗi {resp.status_code}: {resp.text[:200]}")
+    #     except Exception as e:
+    #         log.error(f"❌ Lỗi Teams webhook: {e}")
 
     # ── Gửi qua POWER_AUTOMATE_URL (fallback / song song) ──
     if POWER_AUTOMATE_URL:
-        payload = {
-            "text": (
-                f"Vancouver Jobs — {today_str}\n"
-                f"Tìm được {total} jobs | Có lương: {has_salary}\n"
-                f"Tải file: {download_url or 'N/A'}"
-            ),
-            "drive_url":  drive_folder_url or "",
-            "file_url":   xlsx_file_url    or "",
+        adaptive_card = {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.3",
+            "body": [
+                {
+                    "type": "TextBlock",
+                    "text": f"Vancouver Jobs — {today_str}",
+                    "weight": "Bolder",
+                    "size": "Medium"
+                },
+                {
+                    "type": "FactSet",
+                    "facts": [
+                        {"title": "Tổng jobs:", "value": str(total)},
+                        {"title": "Có lương:", "value": f"{has_salary}/{total}"},
+                        {"title": "Nguồn:", "value": "Indeed + Glassdoor"},
+                        {"title": "File:", "value": csv_path.name.replace(".csv", ".xlsx")},
+                    ]
+                }
+            ],
+            "actions": [
+                {
+                    "type": "Action.OpenUrl",
+                    "title": "📊 Tải Excel",
+                    "url": download_url
+                },
+                {
+                    "type": "Action.OpenUrl",
+                    "title": "📁 Mở Drive",
+                    "url": drive_folder_url or download_url
+                }
+            ] if download_url else []
         }
+
+        payload = {
+            "card": adaptive_card
+        }
+
         try:
-            resp = requests.post(POWER_AUTOMATE_URL,
-                                 headers={"Content-Type": "application/json"},
-                                 data=json.dumps(payload),
-                                 timeout=30)
+            resp = requests.post(
+                POWER_AUTOMATE_URL,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(payload),
+                timeout=30
+            )
             if resp.status_code in (200, 202):
-                log.info("✅ Đã gửi vào Teams (Power Automate).")
+                log.info("✅ Đã gửi Adaptive Card qua Power Automate.")
             else:
                 log.error(f"❌ Power Automate lỗi {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
             log.error(f"❌ Lỗi Power Automate: {e}")
 
-    if not teams_webhook and not POWER_AUTOMATE_URL:
+    if POWER_AUTOMATE_URL:
         log.warning("⚠️  Chưa cấu hình TEAMS_WEBHOOK_URL hoặc POWER_AUTOMATE_URL.")
 
 # ─── SUMMARY ────────────────────────────────────────────────────────────────
