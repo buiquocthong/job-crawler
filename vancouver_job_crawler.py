@@ -937,11 +937,19 @@ def upload_to_drive(csv_path: Path) -> str | None:
         file_id = uploaded["id"]
         log.info(f"✅ Upload thành công: {uploaded['name']} (id={file_id})")
 
+        # Cấp quyền xem cho anyone có link (để Teams có thể mở được)
+        service.permissions().create(
+            fileId=file_id,
+            body={"type": "anyone", "role": "reader"},
+        ).execute()
+
         # Verify
         log.info("🔎 Verifying upload...")
         _verify_upload(service, file_id, csv_path.name, GDRIVE_FOLDER_ID)
 
-        return f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}"
+        file_url   = f"https://drive.google.com/file/d/{file_id}/view"
+        folder_url = f"https://drive.google.com/drive/folders/{GDRIVE_FOLDER_ID}"
+        return folder_url, file_url
 
     except HttpError as e:
         error_str = str(e)
@@ -967,7 +975,7 @@ def upload_to_drive(csv_path: Path) -> str | None:
                       "Chạy lại --get-token và cập nhật secret.")
         else:
             log.error(f"❌ Drive upload lỗi không mong đợi: {e}")
-        return None
+        return None, None
 
 # ─── LẤY OAUTH2 TOKEN (chạy 1 lần) ─────────────────────────────────────────
 
@@ -975,51 +983,91 @@ def get_oauth2_token():
     """
     Chạy: python3 vancouver_job_crawler.py --get-token
 
-    Hướng dẫn:
-      1. Vào https://console.cloud.google.com → chọn project
-      2. APIs & Services → Credentials → Create Credentials → OAuth 2.0 Client IDs
-      3. Application type: Desktop App → Create
-      4. Copy Client ID và Client Secret vào biến dưới (hoặc set env var)
-      5. Chạy script → browser mở ra → đăng nhập Gmail → cho phép
-      6. Copy refresh_token → dán vào GitHub Secret "GDRIVE_REFRESH_TOKEN"
+    Dùng localhost redirect (thay thế oob đã bị Google khai tử từ 2022).
+    Script tự mở browser, tự bắt auth code qua local server — không cần copy/paste.
     """
+    import urllib.parse
+    import urllib.request
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+
     client_id     = GDRIVE_CLIENT_ID     or input("Nhập GDRIVE_CLIENT_ID: ").strip()
     client_secret = GDRIVE_CLIENT_SECRET or input("Nhập GDRIVE_CLIENT_SECRET: ").strip()
 
-    # Bước 1: Tạo URL xác thực
+    REDIRECT_URI = "http://localhost:8080"
+    auth_code_holder = {}   # dùng dict để closure ghi được vào
+
+    # ── Local server bắt redirect từ Google ──
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(parsed.query)
+
+            if "code" in params:
+                auth_code_holder["code"] = params["code"][0]
+                body = b"<h2>Xac thuc thanh cong! Ban co the dong tab nay.</h2>"
+                self.send_response(200)
+            elif "error" in params:
+                auth_code_holder["error"] = params["error"][0]
+                body = f"<h2>Loi: {params['error'][0]}</h2>".encode()
+                self.send_response(400)
+            else:
+                body = b"<h2>Dang cho...</h2>"
+                self.send_response(200)
+
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass   # tắt log mặc định của HTTPServer
+
+    # ── Tạo auth URL ──
     auth_url = (
         "https://accounts.google.com/o/oauth2/v2/auth"
-        f"?client_id={client_id}"
-        "&redirect_uri=urn:ietf:wg:oauth:2.0:oob"
+        f"?client_id={urllib.parse.quote(client_id)}"
+        f"&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
         "&response_type=code"
         "&scope=https://www.googleapis.com/auth/drive"
         "&access_type=offline"
-        "&prompt=consent"           # Bắt buộc để luôn trả về refresh_token
+        "&prompt=consent"
     )
 
     print("\n" + "═"*62)
-    print("  BƯỚC 1: Mở URL sau trong browser và đăng nhập Gmail:")
+    print("  BƯỚC 1: Browser sẽ tự mở — đăng nhập Gmail và cho phép")
     print("═"*62)
-    print(f"\n{auth_url}\n")
+    print(f"\n  URL: {auth_url}\n")
+
     try:
+        import webbrowser
         webbrowser.open(auth_url)
-        print("  (Browser đã tự mở — nếu không thì copy URL trên)\n")
+        print("  (Browser đã tự mở)\n")
     except Exception:
         print("  (Copy URL trên và mở thủ công)\n")
 
-    # Bước 2: Nhập authorization code
-    print("  BƯỚC 2: Sau khi đăng nhập và cho phép, Google sẽ hiển thị")
-    print("  một đoạn code. Copy và dán vào đây:\n")
-    auth_code = input("  Authorization code: ").strip()
+    # ── Chạy local server chờ Google redirect về ──
+    print("  Đang chờ xác thực... (server đang lắng nghe tại localhost:8080)")
+    server = HTTPServer(("localhost", 8080), _Handler)
+    server.handle_request()   # xử lý đúng 1 request rồi dừng
 
-    # Bước 3: Đổi code lấy token
+    if "error" in auth_code_holder:
+        print(f"\n❌ Lỗi xác thực: {auth_code_holder['error']}")
+        return
+    if "code" not in auth_code_holder:
+        print("\n❌ Không nhận được auth code.")
+        return
+
+    auth_code = auth_code_holder["code"]
+    print("  ✅ Đã nhận auth code từ Google.\n")
+
+    # ── Đổi auth code lấy token ──
     resp = requests.post(
         "https://oauth2.googleapis.com/token",
         data={
             "code"         : auth_code,
             "client_id"    : client_id,
             "client_secret": client_secret,
-            "redirect_uri" : "urn:ietf:wg:oauth:2.0:oob",
+            "redirect_uri" : REDIRECT_URI,    # phải khớp với Cloud Console
             "grant_type"   : "authorization_code",
         }
     )
@@ -1028,57 +1076,119 @@ def get_oauth2_token():
         print(f"\n❌ Lỗi lấy token: {resp.text}")
         return
 
-    token_data = resp.json()
+    token_data    = resp.json()
     refresh_token = token_data.get("refresh_token")
 
     if not refresh_token:
-        print("\n❌ Không nhận được refresh_token. "
-              "Hãy chắc chắn đã thêm '&prompt=consent' vào URL.")
+        print("\n❌ Không nhận được refresh_token.")
+        print("   Thử vào https://myaccount.google.com/permissions")
+        print("   Thu hồi quyền của app → chạy lại --get-token.")
         return
 
-    print("\n" + "═"*62)
+    print("═"*62)
     print("  ✅ Lấy token thành công!")
     print("═"*62)
     print(f"\n  REFRESH TOKEN:\n  {refresh_token}\n")
     print("  BƯỚC TIẾP THEO:")
     print("  1. Copy refresh token trên")
     print("  2. GitHub repo → Settings → Secrets → Actions")
-    print("  3. Thêm secret: GDRIVE_REFRESH_TOKEN = <paste ở đây>")
-    print("  4. Cũng thêm: GDRIVE_CLIENT_ID và GDRIVE_CLIENT_SECRET\n")
+    print("  3. Update secret: GDRIVE_REFRESH_TOKEN = <paste ở đây>")
+    print("  4. Cũng cập nhật: GDRIVE_CLIENT_ID và GDRIVE_CLIENT_SECRET\n")
 
 # ─── MS TEAMS / POWER AUTOMATE NOTIFICATION ─────────────────────────────────
 
 def send_teams_notification(df: pd.DataFrame, csv_path: Path,
-                            drive_folder_url: str | None = None):
-    if not POWER_AUTOMATE_URL:
-        log.warning("POWER_AUTOMATE_URL chưa cấu hình — bỏ qua.")
-        return
+                            drive_folder_url: str | None = None,
+                            xlsx_file_url:    str | None = None):
 
-    today_str = date.today().strftime("%d/%m/%Y")
-    total     = len(df)
+    today_str  = date.today().strftime("%d/%m/%Y")
+    total      = len(df)
+    has_salary = int(df["salary_display"].ne("N/A").sum()) if "salary_display" in df.columns else 0
 
-    message = (
-        f"🏙️ Vancouver Jobs — {today_str}\n"
-        f"✅ Tìm được {total} jobs mới\n"
-        f"📁 Xem danh sách: {drive_folder_url or 'N/A'}"
-    )
+    # Chọn link tốt nhất để gắn vào nút tải
+    download_url = xlsx_file_url or drive_folder_url or ""
 
-    payload = {
-        "text"     : message,
-        "drive_url": drive_folder_url or ""
-    }
+    # ── Gửi qua TEAMS_WEBHOOK_URL (Adaptive Card trực tiếp) ──
+    teams_webhook = os.getenv("TEAMS_WEBHOOK_URL", "")
+    if teams_webhook:
+        adaptive_card = {
+            "type": "message",
+            "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                    "type": "AdaptiveCard",
+                    "version": "1.4",
+                    "body": [
+                        {
+                            "type": "TextBlock",
+                            "text": f"Vancouver Jobs — {today_str}",
+                            "weight": "Bolder",
+                            "size": "Medium",
+                            "color": "Accent"
+                        },
+                        {
+                            "type": "FactSet",
+                            "facts": [
+                                {"title": "Tổng jobs tìm được:", "value": str(total)},
+                                {"title": "Có thông tin lương:", "value": f"{has_salary} / {total}"},
+                                {"title": "Nguồn:", "value": "Indeed CA + Glassdoor CA"},
+                                {"title": "File:", "value": csv_path.name.replace(".csv", ".xlsx")},
+                            ]
+                        }
+                    ],
+                    "actions": [
+                        {
+                            "type": "Action.OpenUrl",
+                            "title": "Tải file Excel hôm nay",
+                            "url": download_url
+                        },
+                        {
+                            "type": "Action.OpenUrl",
+                            "title": "Mở folder Drive",
+                            "url": drive_folder_url or download_url
+                        }
+                    ] if download_url else []
+                }
+            }]
+        }
+        try:
+            resp = requests.post(teams_webhook,
+                                 headers={"Content-Type": "application/json"},
+                                 data=json.dumps(adaptive_card),
+                                 timeout=30)
+            if resp.status_code in (200, 202):
+                log.info("✅ Đã gửi Adaptive Card vào Teams (webhook).")
+            else:
+                log.error(f"❌ Teams webhook lỗi {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            log.error(f"❌ Lỗi Teams webhook: {e}")
 
-    try:
-        resp = requests.post(POWER_AUTOMATE_URL,
-                             headers={"Content-Type": "application/json"},
-                             data=json.dumps(payload),
-                             timeout=30)
-        if resp.status_code in (200, 202):
-            log.info("✅ Đã gửi báo cáo vào MS Teams.")
-        else:
-            log.error(f"❌ Power Automate lỗi {resp.status_code}: {resp.text[:300]}")
-    except Exception as e:
-        log.error(f"❌ Lỗi gửi Teams: {e}")
+    # ── Gửi qua POWER_AUTOMATE_URL (fallback / song song) ──
+    if POWER_AUTOMATE_URL:
+        payload = {
+            "text": (
+                f"Vancouver Jobs — {today_str}\n"
+                f"Tìm được {total} jobs | Có lương: {has_salary}\n"
+                f"Tải file: {download_url or 'N/A'}"
+            ),
+            "drive_url":  drive_folder_url or "",
+            "file_url":   xlsx_file_url    or "",
+        }
+        try:
+            resp = requests.post(POWER_AUTOMATE_URL,
+                                 headers={"Content-Type": "application/json"},
+                                 data=json.dumps(payload),
+                                 timeout=30)
+            if resp.status_code in (200, 202):
+                log.info("✅ Đã gửi vào Teams (Power Automate).")
+            else:
+                log.error(f"❌ Power Automate lỗi {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            log.error(f"❌ Lỗi Power Automate: {e}")
+
+    if not teams_webhook and not POWER_AUTOMATE_URL:
+        log.warning("⚠️  Chưa cấu hình TEAMS_WEBHOOK_URL hoặc POWER_AUTOMATE_URL.")
 
 # ─── SUMMARY ────────────────────────────────────────────────────────────────
 
@@ -1169,14 +1279,24 @@ def main():
     print_summary(filtered_df)
 
     # Upload cả CSV và XLSX lên Drive
-    drive_url = upload_to_drive(csv_path)
-    if xlsx_path and drive_url:
-        upload_to_drive(xlsx_path)
-    if drive_url:
-        log.info(f"📁 Drive folder: {drive_url}")
+    drive_folder_url, _ = upload_to_drive(csv_path)          # upload CSV
 
-    send_teams_notification(filtered_df, csv_path, drive_folder_url=drive_url)
+    xlsx_file_url = None
+    if xlsx_path:
+        drive_folder_url2, xlsx_file_url = upload_to_drive(xlsx_path)  # upload XLSX
+        if drive_folder_url2:
+            drive_folder_url = drive_folder_url2  # cùng folder, lấy lại cho chắc
 
+    if drive_folder_url:
+        log.info(f"📁 Drive folder : {drive_folder_url}")
+    if xlsx_file_url:
+        log.info(f"📊 Excel file   : {xlsx_file_url}")
+
+    send_teams_notification(
+        filtered_df, csv_path,
+        drive_folder_url=drive_folder_url,
+        xlsx_file_url=xlsx_file_url,       # ← truyền link file xuống
+    )
 
 # ─── XUẤT EXCEL ─────────────────────────────────────────────────────────────
 
