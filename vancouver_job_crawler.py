@@ -319,11 +319,18 @@ def _clean_interval(v):
     lbl = str(v or "").strip().lower()
     if not lbl or lbl in {"none", "nan"}: return None
     return {
-        "year": "yearly", "yr": "yearly", "annual": "yearly", "yearly": "yearly",
+        # jobspy cũ và mới trả cả lowercase lẫn uppercase (YEARLY, HOURLY...)
+        "year": "yearly", "yr": "yearly", "annual": "yearly", "annually": "yearly",
+        "yearly": "yearly",
         "hour": "hourly", "hr": "hourly", "hourly": "hourly",
         "month": "monthly", "monthly": "monthly",
         "week": "weekly", "weekly": "weekly",
         "day": "daily", "daily": "daily",
+        # CompensationInterval enum values từ jobspy (uppercase)
+        "compensationinterval.yearly": "yearly",
+        "compensationinterval.hourly": "hourly",
+        "compensationinterval.monthly": "monthly",
+        "compensationinterval.weekly": "weekly",
     }.get(lbl, lbl)
 
 
@@ -600,57 +607,58 @@ def _fetch_html(url: str) -> str | None:
 
 def _parse_indeed_mosaic(html: str, currency_hint: str = "CAD"):
     """
-    Indeed nhúng salary vào JSON trong mosaic-data / window._initialData.
-    Đây là nguồn chính xác nhất, không phụ thuộc JS rendering.
+    Indeed nhúng salary vào JavaScript block trong trang (mosaic-data, window.__INDEED_DATA__).
+    Không cần JS rendering — parse trực tiếp từ raw HTML.
 
-    Các pattern được test với Indeed CA 2025-2026.
+    Thứ tự ưu tiên (từ chính xác đến ít chính xác):
+      A. extractedSalary {min, max, type}  — Indeed mosaic numeric, chuẩn nhất
+      B. salarySnippet.text                — string hiển thị trực tiếp cho user
+      C. formattedSalary / salaryRange     — formatted string các dạng khác
+      D. salaryMin / salaryMax numeric     — fallback numeric keys
     """
-    patterns = [
-        # Formatted salary string (hiển thị trực tiếp)
-        r'"(?:formattedSalary|salaryRange|displaySalary)"\s*:\s*"([^"]{5,100})"',
-        # salaryInfo object
-        r'"salaryInfo"\s*:\s*\{[^}]{0,500}"formattedSalary"\s*:\s*"([^"]{5,100})"',
-        # compensation block
-        r'"compensation"\s*:\s*\{[^}]{0,500}"formattedSalary"\s*:\s*"([^"]{5,100})"',
-        # Numeric min/max trong JSON
-        r'"(?:salaryMin|minSalary|minAmount)"\s*:\s*([\d.]+)',
-        # mosaic-data script block
-        r'<script[^>]*id=["\']mosaic-data["\'][^>]*>(.*?)</script>',
-    ]
+    # A. extractedSalary — phổ biến nhất trên Indeed CA 2024-2025
+    # Field order trong JSON có thể là min-max hoặc max-min nên thử cả hai
+    for pat in [
+        r'"extractedSalary"\s*:\s*\{[^}]*"min"\s*:\s*([\d.]+)[^}]*"max"\s*:\s*([\d.]+)[^}]*"type"\s*:\s*"([^"]+)"',
+        r'"extractedSalary"\s*:\s*\{[^}]*"max"\s*:\s*([\d.]+)[^}]*"min"\s*:\s*([\d.]+)[^}]*"type"\s*:\s*"([^"]+)"',
+    ]:
+        m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
+        if m:
+            try:
+                a, b, typ = float(m.group(1)), float(m.group(2)), m.group(3).lower()
+                mn, mx = min(a, b), max(a, b)
+                intv = "hourly" if "hour" in typ else "yearly"
+                return (int(mn), int(mx), intv, currency_hint, "page_mosaic")
+            except Exception:
+                pass
 
-    for pat in patterns:
-        m = re.search(pat, html, re.DOTALL | re.IGNORECASE)
-        if not m: continue
-        try:
-            fragment = m.group(1)
+    # B. salarySnippet.text — string hiển thị cho user, rất tin cậy
+    m = re.search(r'"salarySnippet"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]{5,100})"',
+                  html, re.IGNORECASE)
+    if m:
+        text = m.group(1).replace("\\u2013", "-").replace("\\u2014", "-")
+        parsed = _extract_salary_from_text(text, currency_hint)
+        if parsed: return (*parsed, "page_mosaic")
 
-            # Nếu là JSON block lớn, tìm salary string bên trong
-            if fragment.startswith("{") or "<" not in fragment:
-                sal_m = re.search(
-                    r'"(?:formattedSalary|salaryRange|displaySalary|salary)"\s*:\s*"([^"]{5,100})"',
-                    fragment, re.IGNORECASE
-                )
-                if sal_m:
-                    parsed = _extract_salary_from_text(sal_m.group(1), currency_hint)
-                    if parsed: return (*parsed, "page_mosaic")
+    # C. formattedSalary / salaryRange / displaySalary string
+    m = re.search(
+        r'"(?:formattedSalary|salaryRange|displaySalary|salaryText)"\s*:\s*"([^"]{5,100})"',
+        html, re.IGNORECASE
+    )
+    if m:
+        parsed = _extract_salary_from_text(m.group(1), currency_hint)
+        if parsed: return (*parsed, "page_mosaic")
 
-                # Numeric min/max
-                min_m = re.search(r'"(?:salaryMin|minSalary|minAmount)"\s*:\s*([\d.]+)', fragment)
-                max_m = re.search(r'"(?:salaryMax|maxSalary|maxAmount)"\s*:\s*([\d.]+)', fragment)
-                if min_m:
-                    mn = float(min_m.group(1))
-                    mx = float(max_m.group(1)) if max_m else None
-                    intv = "yearly" if mn > 1000 else "hourly"
-                    return (int(mn), int(mx) if mx else None, intv, currency_hint, "page_mosaic")
-            else:
-                # Là salary string trực tiếp
-                parsed = _extract_salary_from_text(fragment, currency_hint)
-                if parsed: return (*parsed, "page_mosaic")
-        except Exception:
-            continue
+    # D. salaryMin / salaryMax numeric keys (fallback)
+    min_m = re.search(r'"(?:salaryMin|minSalary|minAmount)"\s*:\s*([\d.]+)', html, re.IGNORECASE)
+    max_m = re.search(r'"(?:salaryMax|maxSalary|maxAmount)"\s*:\s*([\d.]+)', html, re.IGNORECASE)
+    if min_m:
+        mn = float(min_m.group(1))
+        mx = float(max_m.group(1)) if max_m else None
+        intv = "hourly" if mn < 500 else "yearly"
+        return (int(mn), int(mx) if mx else None, intv, currency_hint, "page_mosaic")
+
     return None
-
-
 def _parse_jsonld(html: str, currency_hint: str = "CAD"):
     """Parse salary từ JSON-LD schema.org/JobPosting."""
     for m in re.finditer(
