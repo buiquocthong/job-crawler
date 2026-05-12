@@ -458,7 +458,7 @@ def crawl_jobs() -> pd.DataFrame:
                 log.info(f"[{done}/{total}] '{keyword}' @ {location}")
                 try:
                     df = scrape_jobs(
-                        site_name=["indeed", "glassdoor"],
+                        site_name=["indeed"],
                         search_term=keyword, location=location,
                         country_indeed="canada",
                         results_wanted=RESULTS_PER_SEARCH,
