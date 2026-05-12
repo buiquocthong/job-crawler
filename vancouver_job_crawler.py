@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Vancouver Job Crawler  (v4 — OAuth2 Google Drive cho Personal Gmail)
+Vancouver Job Crawler  (v5 — BeautifulSoup DOM parser, Indeed session, RPC endpoint)
 =====================================================================
 Crawl Indeed + Glassdoor: tài chính / data science / C-suite
 Lọc  : Vancouver BC area | min $60k/yr hoặc $30/hr | 3 ngày gần nhất
@@ -40,6 +40,13 @@ import urllib.parse, urllib.request
 from datetime import date, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+try:
+    from bs4 import BeautifulSoup
+    BS4_AVAILABLE = True
+except ImportError:
+    BS4_AVAILABLE = False
+    logging.warning("beautifulsoup4 chưa cài — pip install beautifulsoup4 lxml")
 
 import pandas as pd
 import requests
@@ -553,10 +560,44 @@ _ENRICH_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
     "Cache-Control": "no-cache",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "document",
     "Upgrade-Insecure-Requests": "1",
 }
+
+# Session được warm-up 1 lần duy nhất cho Indeed (lấy cookies CTK, indeed_rcc)
+_indeed_session: requests.Session | None = None
+
+def _get_indeed_session() -> requests.Session:
+    """
+    Tạo/trả về một requests.Session đã warm-up với ca.indeed.com.
+    Session lưu cookie tự động — giảm nguy cơ bị 403 khi fetch job page.
+    """
+    global _indeed_session
+    if _indeed_session is not None:
+        return _indeed_session
+
+    sess = requests.Session()
+    sess.headers.update(_ENRICH_HEADERS)
+
+    proxies = _build_proxies()
+    if proxies:
+        sess.proxies.update(proxies)
+
+    try:
+        # Warm-up: request trang chính để nhận cookies (CTK, indeed_rcc, ...)
+        sess.get("https://ca.indeed.com/", timeout=ENRICH_TIMEOUT, allow_redirects=True)
+        log.debug("Indeed session warm-up OK")
+    except Exception as e:
+        log.debug(f"Indeed session warm-up failed (non-fatal): {e}")
+
+    _indeed_session = sess
+    return sess
 
 
 def _build_proxies() -> dict | None:
@@ -565,11 +606,11 @@ def _build_proxies() -> dict | None:
     return {"http": proxy_url, "https": proxy_url}
 
 
-def _fetch_html(url: str) -> str | None:
+def _fetch_html(url: str, referer: str | None = None) -> str | None:
     """
     Fetch HTML của một URL.
     Ưu tiên ScraperAPI (nếu có key) để bypass Indeed block.
-    Fallback sang requests trực tiếp với proxy.
+    Fallback sang session Indeed đã warm-up (có cookie) hoặc requests thông thường.
     """
     # ScraperAPI — bypass Indeed/Glassdoor anti-bot tốt nhất
     if SCRAPER_API_KEY:
@@ -580,20 +621,31 @@ def _fetch_html(url: str) -> str | None:
                     "api_key": SCRAPER_API_KEY,
                     "url": url,
                     "render": "true",
+                    "country_code": "ca",
                 })
             )
-            resp = requests.get(api_url, timeout=30)
+            resp = requests.get(api_url, timeout=45)
             if resp.status_code == 200:
                 return resp.text
             log.debug(f"ScraperAPI {resp.status_code} for {url[:60]}")
         except Exception as e:
             log.debug(f"ScraperAPI error: {e}")
 
-    # Fallback: requests trực tiếp với proxy
+    # Fallback: session với cookie (cho Indeed) hoặc plain requests
     try:
-        proxies = _build_proxies()
-        resp = requests.get(url, headers=_ENRICH_HEADERS, proxies=proxies,
+        extra_headers: dict = {}
+        if referer:
+            extra_headers["Referer"] = referer
+        if "indeed.com" in url:
+            # Dùng session đã warm-up để mang cookie CTK / indeed_rcc
+            sess = _get_indeed_session()
+            resp = sess.get(url, headers=extra_headers,
                             timeout=ENRICH_TIMEOUT, allow_redirects=True)
+        else:
+            proxies = _build_proxies()
+            resp = requests.get(url, headers={**_ENRICH_HEADERS, **extra_headers},
+                                proxies=proxies, timeout=ENRICH_TIMEOUT, allow_redirects=True)
+
         if resp.status_code == 200:
             return resp.text
         log.debug(f"HTTP {resp.status_code} for {url[:60]}")
@@ -605,51 +657,230 @@ def _fetch_html(url: str) -> str | None:
     return None
 
 
+def _extract_jk_from_url(url: str) -> str | None:
+    """Extract job key từ Indeed URL (viewjob?jk=...)."""
+    m = re.search(r'[?&]jk=([a-f0-9]+)', str(url or ""))
+    return m.group(1) if m else None
+
+
+def _fetch_salary_indeed_rpc(jk: str, currency_hint: str = "CAD"):
+    """
+    [FIX] Dùng Indeed's internal RPC endpoint thay vì render full page.
+    URL: https://ca.indeed.com/rpc/jobdescs?jks={jk}
+    Nhẹ hơn, trả về JSON với extractedSalary — ít bị block hơn full page.
+    Returns (mn, mx, interval, currency, source) hoặc None.
+    """
+    url = f"https://ca.indeed.com/rpc/jobdescs?jks={jk}"
+    try:
+        sess = _get_indeed_session()
+        resp = sess.get(
+            url,
+            headers={
+                "Referer": f"https://ca.indeed.com/viewjob?jk={jk}",
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "application/json, text/javascript, */*; q=0.01",
+            },
+            timeout=ENRICH_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        job = data.get(jk) or (list(data.values())[0] if data else {})
+        if not isinstance(job, dict):
+            return None
+
+        # Path 1: extractedSalary numeric object
+        es = job.get("extractedSalary") or job.get("salaryExtracted")
+        if isinstance(es, dict):
+            mn = _to_number(es.get("min") or es.get("salaryMin") or es.get("minAmount"))
+            mx = _to_number(es.get("max") or es.get("salaryMax") or es.get("maxAmount"))
+            typ = str(es.get("type") or es.get("payPeriodType") or "").lower()
+            intv = "hourly" if "hour" in typ else "yearly"
+            if mn:
+                return (mn, mx, intv, currency_hint, "indeed_rpc")
+
+        # Path 2: salarySnippet / formattedSalary string
+        for key in ("salarySnippet", "formattedSalary", "salaryText", "salaryRange"):
+            sal_text = job.get(key)
+            if sal_text and isinstance(sal_text, str):
+                parsed = _extract_salary_from_text(sal_text, currency_hint)
+                if parsed:
+                    return (*parsed, "indeed_rpc")
+
+        # Path 3: salary trong nested displayAttributes
+        for attr in job.get("displayAttributes", []):
+            if isinstance(attr, dict) and "salary" in str(attr).lower():
+                for v in attr.values():
+                    parsed = _extract_salary_from_text(str(v), currency_hint)
+                    if parsed:
+                        return (*parsed, "indeed_rpc")
+
+    except Exception as e:
+        log.debug(f"Indeed RPC error jk={jk}: {e}")
+
+    return None
+
+
 def _parse_indeed_mosaic(html: str, currency_hint: str = "CAD"):
     """
-    Indeed nhúng salary vào JavaScript block trong trang (mosaic-data, window.__INDEED_DATA__).
-    Không cần JS rendering — parse trực tiếp từ raw HTML.
+    [FIX] Indeed nhúng salary vào JavaScript trong trang.
+    Phương pháp mới: parse JSON thực sự từ <script id="mosaic-data">
+    thay vì dùng regex [^}]* không handle được nested objects.
 
-    Thứ tự ưu tiên (từ chính xác đến ít chính xác):
-      A. extractedSalary {min, max, type}  — Indeed mosaic numeric, chuẩn nhất
-      B. salarySnippet.text                — string hiển thị trực tiếp cho user
-      C. formattedSalary / salaryRange     — formatted string các dạng khác
-      D. salaryMin / salaryMax numeric     — fallback numeric keys
+    Thứ tự ưu tiên:
+      A. <script id="mosaic-data"> JSON → extractedSalary, salaryInfoAndJobType
+      B. window._initialData / window.__INDEED_DATA__ JSON
+      C. Regex fallback (cho các format cũ)
     """
-    # A. extractedSalary — phổ biến nhất trên Indeed CA 2024-2025
-    # Field order trong JSON có thể là min-max hoặc max-min nên thử cả hai
-    for pat in [
-        r'"extractedSalary"\s*:\s*\{[^}]*"min"\s*:\s*([\d.]+)[^}]*"max"\s*:\s*([\d.]+)[^}]*"type"\s*:\s*"([^"]+)"',
-        r'"extractedSalary"\s*:\s*\{[^}]*"max"\s*:\s*([\d.]+)[^}]*"min"\s*:\s*([\d.]+)[^}]*"type"\s*:\s*"([^"]+)"',
+    # ── A. Parse <script id="mosaic-data"> thành JSON thực ─────────────────
+    m_script = re.search(
+        r'<script\s+id=["\']mosaic-data["\'][^>]*>\s*(.*?)\s*</script>',
+        html, re.DOTALL | re.IGNORECASE
+    )
+    if m_script:
+        try:
+            mosaic = json.loads(m_script.group(1))
+            for provider_data in [mosaic.get("providerData", {}),
+                                   mosaic.get("data", {}).get("providerData", {})]:
+                if not isinstance(provider_data, dict):
+                    continue
+                for _provider_key, provider in provider_data.items():
+                    if not isinstance(provider, dict):
+                        continue
+
+                    # Path A1: jobTitleHeaderData → salaryInfoAndJobType
+                    sal_info = (provider
+                                .get("jobTitleHeaderData", {})
+                                .get("salaryInfoAndJobType", {}))
+                    for sub in [sal_info.get("salaryOnly", {}), sal_info]:
+                        if not isinstance(sub, dict):
+                            continue
+                        for key in ("formattedSalary", "salaryText", "salaryRange",
+                                    "displayedSalary"):
+                            txt = sub.get(key)
+                            if txt:
+                                parsed = _extract_salary_from_text(str(txt), currency_hint)
+                                if parsed:
+                                    return (*parsed, "page_mosaic")
+
+                    # Path A2: extractedSalary numeric
+                    es = (provider.get("extractedSalary")
+                          or provider.get("jobData", {}).get("extractedSalary"))
+                    if isinstance(es, dict):
+                        mn = _to_number(es.get("min") or es.get("salaryMin"))
+                        mx = _to_number(es.get("max") or es.get("salaryMax"))
+                        typ = str(es.get("type") or "").lower()
+                        if mn:
+                            intv = "hourly" if "hour" in typ else "yearly"
+                            return (mn, mx, intv, currency_hint, "page_mosaic")
+
+                    # Path A3: salarySnippet text
+                    snip = provider.get("salarySnippet")
+                    if isinstance(snip, dict):
+                        txt = snip.get("text") or snip.get("displayText")
+                    elif isinstance(snip, str):
+                        txt = snip
+                    else:
+                        txt = None
+                    if txt:
+                        parsed = _extract_salary_from_text(
+                            txt.replace("\\u2013", "-").replace("\\u2014", "-"),
+                            currency_hint
+                        )
+                        if parsed:
+                            return (*parsed, "page_mosaic")
+
+                    # Path A4: jobCardData → salary fields
+                    jcd = provider.get("jobCardData") or {}
+                    if isinstance(jcd, dict):
+                        for key in ("formattedSalary", "salaryText", "salarySnippet"):
+                            txt = jcd.get(key)
+                            if txt:
+                                parsed = _extract_salary_from_text(str(txt), currency_hint)
+                                if parsed:
+                                    return (*parsed, "page_mosaic")
+
+        except (json.JSONDecodeError, AttributeError) as e:
+            log.debug(f"mosaic-data JSON parse error: {e}")
+
+    # ── B. window._initialData / window.__INDEED_DATA__ ────────────────────
+    for init_pat in [
+        r'window\._initialData\s*=\s*(\{.*?\});\s*(?:window|</script>)',
+        r'window\.__INDEED_DATA__\s*=\s*(\{.*?\});\s*(?:window|</script>)',
+        r'"jobData"\s*:\s*(\{[^<]{20,5000}\})',
     ]:
-        m = re.search(pat, html, re.IGNORECASE | re.DOTALL)
-        if m:
+        m2 = re.search(init_pat, html, re.DOTALL)
+        if not m2:
+            continue
+        # JSON có thể bị truncate — thử parse an toàn
+        raw = m2.group(1)
+        # tìm extractedSalary bên trong raw string (không cần parse toàn bộ)
+        es_m = re.search(
+            r'"extractedSalary"\s*:\s*\{([^}]{5,200})\}', raw, re.IGNORECASE
+        )
+        if es_m:
+            inner = "{" + es_m.group(1) + "}"
             try:
-                a, b, typ = float(m.group(1)), float(m.group(2)), m.group(3).lower()
+                es = json.loads(inner)
+                mn = _to_number(es.get("min") or es.get("salaryMin"))
+                mx = _to_number(es.get("max") or es.get("salaryMax"))
+                typ = str(es.get("type") or "").lower()
+                if mn:
+                    intv = "hourly" if "hour" in typ else "yearly"
+                    return (mn, mx, intv, currency_hint, "page_mosaic")
+            except Exception:
+                pass
+
+        # Salary text bên trong raw
+        for sal_key in ("formattedSalary", "salaryRange", "displaySalary",
+                        "salaryText", "salarySnippet"):
+            sm = re.search(
+                rf'"{sal_key}"\s*:\s*"([^"{{}}]{{5,100}})"', raw, re.IGNORECASE
+            )
+            if sm:
+                parsed = _extract_salary_from_text(sm.group(1), currency_hint)
+                if parsed:
+                    return (*parsed, "page_mosaic")
+
+    # ── C. Regex fallback (format cũ / simple JSON) ─────────────────────────
+    # extractedSalary với flat JSON (không nested) — dùng lookahead thay vì [^}]*
+    for pat in [
+        # flat extractedSalary: {"min":80000,"max":100000,"type":"yearly"}
+        r'"extractedSalary"\s*:\s*\{"min"\s*:\s*([\d.]+)\s*,\s*"max"\s*:\s*([\d.]+)\s*,\s*"type"\s*:\s*"([^"]+)"',
+        r'"extractedSalary"\s*:\s*\{"max"\s*:\s*([\d.]+)\s*,\s*"min"\s*:\s*([\d.]+)\s*,\s*"type"\s*:\s*"([^"]+)"',
+    ]:
+        mc = re.search(pat, html, re.IGNORECASE)
+        if mc:
+            try:
+                a, b, typ = float(mc.group(1)), float(mc.group(2)), mc.group(3).lower()
                 mn, mx = min(a, b), max(a, b)
                 intv = "hourly" if "hour" in typ else "yearly"
                 return (int(mn), int(mx), intv, currency_hint, "page_mosaic")
             except Exception:
                 pass
 
-    # B. salarySnippet.text — string hiển thị cho user, rất tin cậy
-    m = re.search(r'"salarySnippet"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]{5,100})"',
-                  html, re.IGNORECASE)
-    if m:
-        text = m.group(1).replace("\\u2013", "-").replace("\\u2014", "-")
+    # salarySnippet.text
+    m3 = re.search(
+        r'"salarySnippet"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]{5,100})"',
+        html, re.IGNORECASE
+    )
+    if m3:
+        text = m3.group(1).replace("\\u2013", "-").replace("\\u2014", "-")
         parsed = _extract_salary_from_text(text, currency_hint)
-        if parsed: return (*parsed, "page_mosaic")
+        if parsed:
+            return (*parsed, "page_mosaic")
 
-    # C. formattedSalary / salaryRange / displaySalary string
-    m = re.search(
+    # formattedSalary / salaryRange string
+    m4 = re.search(
         r'"(?:formattedSalary|salaryRange|displaySalary|salaryText)"\s*:\s*"([^"]{5,100})"',
         html, re.IGNORECASE
     )
-    if m:
-        parsed = _extract_salary_from_text(m.group(1), currency_hint)
-        if parsed: return (*parsed, "page_mosaic")
+    if m4:
+        parsed = _extract_salary_from_text(m4.group(1), currency_hint)
+        if parsed:
+            return (*parsed, "page_mosaic")
 
-    # D. salaryMin / salaryMax numeric keys (fallback)
+    # salaryMin / salaryMax numeric
     min_m = re.search(r'"(?:salaryMin|minSalary|minAmount)"\s*:\s*([\d.]+)', html, re.IGNORECASE)
     max_m = re.search(r'"(?:salaryMax|maxSalary|maxAmount)"\s*:\s*([\d.]+)', html, re.IGNORECASE)
     if min_m:
@@ -700,6 +931,28 @@ def _parse_jsonld(html: str, currency_hint: str = "CAD"):
 
 
 # HTML selectors để extract salary text từ Indeed + Glassdoor
+# ──────────────────────────────────────────────────────────────────────────────
+# RENDERED DOM SALARY PARSER
+# Port từ JS code (cheerio selectors) — hoạt động khi HTML đã được ScraperAPI
+# render với render=true: JS của Indeed chạy xong → salary element có trong DOM.
+# Đây là lý do JS code đạt 100% salary coverage còn Python chỉ ~30%.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Các CSS selector theo thứ tự ưu tiên (copy từ JS code)
+_DOM_SALARY_SELECTORS = [
+    '[data-testid="attribute_snippet_testid"]',
+    '[data-testid="salary-snippet"]',
+    '[data-testid="salaryInfoAndJobType"]',
+    '[data-testid="jobsearch-JobMetadataHeader-salaryInfoAndJobType"]',
+    ".salary-snippet-container",
+    ".estimated-salary-container",
+    '[class*="salaryInfo"]',
+    ".jobsearch-JobMetadataHeader-item",
+    '[class*="salary"]',
+    '[class*="Salary"]',
+]
+
+# Regex fallback cho HTML thô (raw, chưa render)
 _HTML_SALARY_SELECTORS = [
     r'(?:data-testid=["\']salaryInfoAndJobType["\'][^>]*>)(.*?)(?=<)',
     r'(?:class=["\'][^"\']*salary[^"\']*["\'][^>]*>)\s*([^<]{5,80})',
@@ -709,25 +962,95 @@ _HTML_SALARY_SELECTORS = [
 ]
 
 
+def _parse_rendered_dom_salary(html: str, currency_hint: str = "CAD"):
+    """
+    Port trực tiếp từ hàm parseSalary() trong JS code (dùng cheerio).
+
+    Hoạt động với HTML đã render (ScraperAPI render=true): JS của Indeed chạy xong,
+    salary element xuất hiện trong DOM với data-testid cụ thể → select trực tiếp bằng
+    BeautifulSoup, không cần parse JSON mosaic hay regex phức tạp.
+
+    Đây là lý do JS code đạt ~100% salary coverage:
+      JS:     scraperGet(url, render=true) → cheerio.find('[data-testid="salary-snippet"]')
+      Python: (cũ) parse mosaic JSON regex → miss nhiều job
+      Python: (mới) BeautifulSoup.select_one(selector) → tương đương cheerio
+    """
+    if not BS4_AVAILABLE or not html:
+        return None
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+        except Exception:
+            return None
+
+    for sel in _DOM_SALARY_SELECTORS:
+        try:
+            el = soup.select_one(sel)
+            if not el:
+                continue
+            text = el.get_text(separator=" ", strip=True)
+            # Chỉ xử lý nếu có dấu $ hoặc từ "salary"
+            if "$" not in text and "salary" not in text.lower():
+                continue
+            parsed = _extract_salary_from_text(text, currency_hint)
+            if parsed:
+                return (*parsed, "dom_rendered")
+        except Exception:
+            continue
+
+    return None
+
+
 def _fetch_salary_from_url(url: str, currency_hint: str = "CAD"):
-    """Fetch một URL và trả về (mn, mx, interval, currency, source) hoặc None."""
+    """
+    [FIX v2] Fetch một URL và trả về (mn, mx, interval, currency, source) hoặc None.
+
+    Thứ tự ưu tiên (port logic từ JS code):
+      1. Indeed RPC endpoint (jks) — nhẹ, ít bị block
+      2. Fetch full page → _parse_rendered_dom_salary (BeautifulSoup, giống cheerio của JS)
+      3. _parse_indeed_mosaic (JSON từ <script id="mosaic-data">)
+      4. _parse_jsonld (schema.org structured data — tốt cho Workday/Greenhouse ATS)
+      5. HTML regex selectors (fallback cho raw HTML)
+      6. Full-text scan (last resort)
+    """
     if not url or not url.startswith("http"):
         return None
 
-    html = _fetch_html(url)
+    # ── 1. Indeed RPC (nhẹ, thử trước) ─────────────────────────────────────
+    if "indeed.com" in url:
+        jk = _extract_jk_from_url(url)
+        if jk:
+            result = _fetch_salary_indeed_rpc(jk, currency_hint)
+            if result:
+                return result
+
+    # ── 2-6. Fetch full page ─────────────────────────────────────────────────
+    referer = "https://ca.indeed.com/" if "indeed.com" in url else None
+    html = _fetch_html(url, referer=referer)
     if not html:
         return None
 
-    # Indeed: mosaic JSON là nguồn chính xác nhất
+    # ── 2. Rendered DOM (BeautifulSoup — port của cheerio trong JS code) ─────
+    #    Hoạt động tốt nhất khi ScraperAPI render=true: JS chạy → DOM có salary element
+    result = _parse_rendered_dom_salary(html, currency_hint)
+    if result:
+        return result
+
+    # ── 3. Indeed mosaic JSON (raw HTML, không cần render) ───────────────────
     if "indeed.com" in url:
         result = _parse_indeed_mosaic(html, currency_hint)
-        if result: return result
+        if result:
+            return result
 
-    # JSON-LD (schema.org) — chuẩn nhất cho các ATS
+    # ── 4. JSON-LD schema.org (Workday, Greenhouse, Lever ATS) ──────────────
     result = _parse_jsonld(html, currency_hint)
-    if result: return result
+    if result:
+        return result
 
-    # HTML selectors
+    # ── 5. HTML regex selectors ──────────────────────────────────────────────
     for sel in _HTML_SALARY_SELECTORS:
         m = re.search(sel, html, re.IGNORECASE | re.DOTALL)
         if m:
@@ -736,7 +1059,7 @@ def _fetch_salary_from_url(url: str, currency_hint: str = "CAD"):
             if parsed:
                 return (*parsed, "page_html")
 
-    # Fallback: scan text đầu trang (salary thường xuất hiện sớm)
+    # ── 6. Full-text scan (last resort) ─────────────────────────────────────
     text_only = re.sub(r"<[^>]+>", " ", html[:20000])
     text_only = re.sub(r"\s+", " ", text_only)
     parsed = _extract_salary_from_text(text_only, currency_hint)
@@ -798,9 +1121,12 @@ def enrich_salaries(df: pd.DataFrame) -> pd.DataFrame:
 
     pct = f"{enriched/len(na_df)*100:.0f}%" if len(na_df) > 0 else "0%"
     log.info(f"✅ Enrich xong: +{enriched}/{len(na_df)} jobs có lương ({pct})")
-    if enriched == 0 and not _proxy_env and not SCRAPER_API_KEY:
-        log.warning("⚠️  Enrich = 0. Indeed thường chặn request trực tiếp.")
-        log.warning("   Set JOB_PROXY=user:pass@host:port hoặc SCRAPER_API_KEY để bypass.")
+    if enriched == 0:
+        log.warning("⚠️  Enrich = 0. Indeed chặn request trực tiếp từ datacenter/CI.")
+        log.warning("   → Giải pháp bắt buộc (1 trong 2):")
+        log.warning("     [A] SCRAPER_API_KEY=<key>  — scraperapi.com, ~$50/mo, bypass tốt nhất")
+        log.warning("     [B] JOB_PROXY=user:pass@host:port — residential proxy")
+        log.warning("   Không có proxy → salary coverage ~20-30%% (chỉ từ desc_parse).")
     return df
 
 # ─── LỌC ────────────────────────────────────────────────────────────────────

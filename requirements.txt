@@ -17,3 +17,6 @@ google-auth-httplib2>=0.1.1
 
 # Open excel file
 openpyxl
+
+beautifulsoup4>=4.12
+lxml>=5.0
