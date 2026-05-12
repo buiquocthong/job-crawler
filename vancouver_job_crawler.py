@@ -96,9 +96,9 @@ def _clean_interval(v) -> str | None:
     lbl = str(v or "").strip().lower().split(".")[-1]  # handle CompensationInterval.YEARLY
     return {
         "yearly": "yearly", "year": "yearly", "yr": "yearly", "annual": "yearly", "annually": "yearly",
-        "hourly": "hourly", "hour": "hourly", "hr": "hourly", "an hour": "hourly",
+        "hourly": "hourly", "hour": "hourly", "hr": "hourly",
         "monthly": "monthly", "month": "monthly",
-        "weekly": "weekly", "week": "weekly", "a week": "weekly",
+        "weekly": "weekly", "week": "weekly",
     }.get(lbl)
 
 
@@ -196,15 +196,19 @@ def format_salary(row) -> str:
     intv = str(row.get("interval") or "")
     curr = str(row.get("currency") or "CAD")
     src  = str(row.get("salary_source") or "")
-    if mn is None and mx is None: return "N/A"
 
-    def fmt(v):
-        if v is None: return None
-        return f"${int(float(v)):,}" if float(v) > 200 else f"${float(v):.2f}"
+    def fmt(v) -> str | None:
+        # Phải dùng _isna() thay vì "is None" vì pandas gán None → numpy.float64 NaN
+        # float('nan') > 200 = False → f"${float(v):.2f}" → "$nan" (bug!)
+        if _isna(v): return None
+        f = float(v)
+        return f"${int(f):,}" if f > 200 else f"${f:.2f}"
 
     parts = [p for p in [fmt(mn), fmt(mx)] if p]
-    lbl   = {"yearly": "/yr", "hourly": "/hr", "monthly": "/mo", "weekly": "/wk"}.get(intv, "")
-    est   = " (est.)" if "parse" in src else ""
+    if not parts: return "N/A"
+
+    lbl = {"yearly": "/yr", "hourly": "/hr", "monthly": "/mo", "weekly": "/wk"}.get(intv, "")
+    est = " (est.)" if "parse" in src else ""
     return f"{curr} {' - '.join(parts)}{lbl}{est}"
 
 
@@ -454,8 +458,7 @@ def crawl_jobs() -> pd.DataFrame:
                 log.info(f"[{done}/{total}] '{keyword}' @ {location}")
                 try:
                     df = scrape_jobs(
-                        # site_name=["indeed", "glassdoor"],
-                        site_name=["indeed"],
+                        site_name=["indeed", "glassdoor"],
                         search_term=keyword, location=location,
                         country_indeed="canada",
                         results_wanted=RESULTS_PER_SEARCH,
@@ -683,7 +686,7 @@ def send_teams_notification(df: pd.DataFrame, folder_url: str | None, file_url: 
             {"type": "FactSet", "facts": [
                 {"title": "Tổng jobs:",  "value": str(len(df))},
                 {"title": "Có lương:",   "value": f"{has_sal}/{len(df)}"},
-                {"title": "Nguồn:",      "value": "Indeed"},
+                {"title": "Nguồn:",      "value": "Indeed + Glassdoor CA"},
             ]},
         ],
         "actions": ([
