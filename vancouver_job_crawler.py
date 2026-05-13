@@ -274,46 +274,40 @@ def _build_proxies() -> dict | None:
     return {"http": url, "https": url}
 
 
-def _fetch_html(url: str) -> str | None:
-    """
-    Fetch job page HTML.
-
-    KEY FIX: Dùng ScraperAPI với render=true — đây là lý do JS code đạt ~100%
-    salary coverage. render=true cho phép JavaScript của Indeed chạy hoàn toàn
-    trước khi trả HTML, do đó salary element với data-testid xuất hiện trong DOM.
-    Không có render=true, salary thường chỉ nằm trong JS bundle (không parse được
-    bằng regex thông thường).
-    """
+def _fetch_html(url: str, render: bool = False) -> str | None:
+    """Fetch HTML. render=True khi cần JS execution (redirect tracker, Workday, ATS)."""
     if SCRAPER_API_KEY:
         try:
             resp = requests.get(
                 "https://api.scraperapi.com/",
                 params={"api_key": SCRAPER_API_KEY, "url": url,
-                        "render": "true", "country_code": "ca"},
+                        "render": "true" if render else "false",
+                        "country_code": "ca"},
                 timeout=60,
             )
             if resp.status_code == 200:
                 return resp.text
         except Exception as e:
             log.debug(f"ScraperAPI error: {e}")
-
-    # Fallback: direct request với session (có cookie)
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Accept-Language": "en-CA,en;q=0.9",
-        }
-        resp = requests.get(url, headers=headers, proxies=_build_proxies(), timeout=20)
+        resp = requests.get(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+                     "Accept-Language": "en-CA,en;q=0.9"},
+            proxies=_build_proxies(), timeout=20, allow_redirects=True,
+        )
         if resp.status_code == 200:
             return resp.text
     except Exception as e:
         log.debug(f"Fetch error {url[:60]}: {e}")
-
     return None
 
 
-# Các CSS selector salary (port từ JS code — parseSalary dùng cheerio selectors)
+# Redirect tracker — dùng JS redirect (meta refresh / window.location) → cần render=True
+_REDIRECT_DOMAINS = ("jsv3.recruitics.com", "click.appcast.io", "rfer.us", "lnkd.in")
+
+# CSS selectors — port 1:1 từ JS code (parseSalary + cheerio)
 _SALARY_SELECTORS = [
     '[data-testid="attribute_snippet_testid"]',
     '[data-testid="salary-snippet"]',
@@ -327,51 +321,45 @@ _SALARY_SELECTORS = [
 ]
 
 
-def _parse_salary_from_html(html: str, currency_hint="CAD") -> tuple | None:
-    """
-    Parse salary từ HTML đã fetch. 3 lớp fallback:
-    1. BeautifulSoup DOM selectors (hoạt động khi HTML đã JS-rendered)
-    2. JSON embedded trong <script> (mosaic-data, JSON-LD)
-    3. Text scan toàn trang
-    """
-    if not html: return None
+def _parse_salary_from_html(html: str, currency_hint: str = "CAD") -> tuple | None:
+    """3 lớp parser: DOM selectors → JSON scripts → full-text scan."""
+    if not html:
+        return None
 
-    # Layer 1: DOM selectors (hiệu quả nhất khi ScraperAPI render=true)
+    # Layer 1: DOM selectors (render=True → salary element có trong DOM, y như cheerio JS)
     try:
         soup = BeautifulSoup(html, "lxml")
         for sel in _SALARY_SELECTORS:
             el = soup.select_one(sel)
-            if not el: continue
+            if not el:
+                continue
             text = el.get_text(separator=" ", strip=True)
             if "$" in text or "salary" in text.lower():
                 parsed = parse_salary_text(text, currency_hint)
-                if parsed: return parsed
+                if parsed:
+                    return parsed
     except Exception:
         pass
 
-    # Layer 2a: Indeed mosaic-data JSON (raw HTML)
+    # Layer 2a: Indeed mosaic-data JSON
     m = re.search(r'<script\s+id=["\']mosaic-data["\'][^>]*>(.*?)</script>',
                   html, re.DOTALL | re.IGNORECASE)
     if m:
         try:
-            mosaic = json.loads(m.group(1))
-            json_str = json.dumps(mosaic)
-            # extractedSalary numeric
-            es_m = re.search(
+            json_str = json.dumps(json.loads(m.group(1)))
+            es = re.search(
                 r'"extractedSalary"\s*:\s*\{"min"\s*:\s*([\d.]+)[^}]*"max"\s*:\s*([\d.]+)[^}]*"type"\s*:\s*"([^"]+)"',
-                json_str, re.IGNORECASE
-            )
-            if es_m:
-                mn, mx = float(es_m.group(1)), float(es_m.group(2))
-                intv = "hourly" if "hour" in es_m.group(3).lower() else "yearly"
-                return int(min(mn, mx)), int(max(mn, mx)), intv, currency_hint
-            # salarySnippet / formattedSalary text
-            for key in ("salarySnippet", "formattedSalary", "salaryText", "salaryRange"):
+                json_str, re.IGNORECASE)
+            if es:
+                mn, mx = float(es.group(1)), float(es.group(2))
+                return int(min(mn, mx)), int(max(mn, mx)), \
+                       ("hourly" if "hour" in es.group(3).lower() else "yearly"), currency_hint
+            for key in ("salarySnippet", "formattedSalary", "salaryText"):
                 sm = re.search(rf'"{key}"\s*:\s*"([^"{{}}]{{5,100}})"', json_str, re.IGNORECASE)
                 if sm:
-                    text = sm.group(1).replace("\\u2013", "-")
-                    parsed = parse_salary_text(text, currency_hint)
-                    if parsed: return parsed
+                    parsed = parse_salary_text(sm.group(1).replace("\\u2013", "-"), currency_hint)
+                    if parsed:
+                        return parsed
         except Exception:
             pass
 
@@ -380,18 +368,16 @@ def _parse_salary_from_html(html: str, currency_hint="CAD") -> tuple | None:
                           html, re.DOTALL | re.IGNORECASE):
         try:
             data = json.loads(m.group(1))
-            items = data if isinstance(data, list) else [data]
-            for item in items:
+            for item in (data if isinstance(data, list) else [data]):
                 bs = item.get("baseSalary") or item.get("estimatedSalary")
-                if not bs or not isinstance(bs, dict): continue
+                if not isinstance(bs, dict):
+                    continue
                 val = bs.get("value") or {}
-                if isinstance(val, dict):
-                    text = f"${val.get('minValue','')} - ${val.get('maxValue','')} {val.get('unitText','')}".strip()
-                elif isinstance(val, (int, float, str)):
-                    text = f"${val} {bs.get('unitText','')}".strip()
-                else: continue
+                text = (f"${val.get('minValue','')} - ${val.get('maxValue','')} {val.get('unitText','')}"
+                        if isinstance(val, dict) else f"${val} {bs.get('unitText','')}").strip()
                 parsed = parse_salary_text(text, currency_hint)
-                if parsed: return parsed
+                if parsed:
+                    return parsed
         except Exception:
             pass
 
@@ -400,40 +386,135 @@ def _parse_salary_from_html(html: str, currency_hint="CAD") -> tuple | None:
     return parse_salary_text(text_only, currency_hint)
 
 
+def _fetch_ats_salary(url: str, curr: str) -> tuple | None:
+    """
+    ATS-specific JSON API parsers — không cần fetch HTML, gọi thẳng API.
+
+    Root cause của 30/45 job N/A:
+      - Workday       (4x): salary trong JSON API /wday/cxs/
+      - SmartRecruit  (3x): public JSON API api.smartrecruiters.com
+      - Lever         (3x): public JSON API api.lever.co
+      - Ashby         (2x): GraphQL API jobs.ashbyhq.com
+    Remaining 11/45 là "OTHER" — companies không disclose salary (không fix được bằng code).
+    """
+    # Workday
+    wd = re.search(r"([\w-]+\.wd\d+\.myworkdayjobs\.com)/([^/]+)/job/[^/]+/[^/]+/([\w-]+)", url)
+    if wd:
+        host, locale, job_id = wd.group(1), wd.group(2), wd.group(3)
+        try:
+            api = f"https://{host}/wday/cxs/{host.split('.')[0]}/{locale}/jobs/{job_id}"
+            r = requests.get(api, headers={"Accept": "application/json"}, timeout=15)
+            if r.status_code == 200:
+                jd = r.json().get("jobPostingInfo") or r.json()
+                for key in ("jobCompensationRange", "compensationRange"):
+                    cr = jd.get(key) or {}
+                    mn = cr.get("minimumSalary") or cr.get("min")
+                    if mn:
+                        mx = cr.get("maximumSalary") or cr.get("max")
+                        return int(float(mn)), (int(float(mx)) if mx else None), "yearly", curr
+                desc = jd.get("jobDescription", {}).get("jobDescription") or ""
+                parsed = parse_salary_text(re.sub(r"<[^>]+>", " ", desc), curr)
+                if parsed:
+                    return parsed
+        except Exception as e:
+            log.debug(f"Workday API: {e}")
+
+    # SmartRecruiters
+    sr = re.search(r"smartrecruiters\.com/([\w-]+)/([\w-]+)", url)
+    if sr:
+        try:
+            r = requests.get(f"https://api.smartrecruiters.com/v1/companies/{sr.group(1)}/postings/{sr.group(2)}", timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                comp = data.get("compensation") or {}
+                mn = comp.get("min") or comp.get("from")
+                if mn:
+                    mx, intv = comp.get("max") or comp.get("to"), "hourly" if "hour" in str(comp.get("type", "")).lower() else "yearly"
+                    return int(float(mn)), (int(float(mx)) if mx else None), intv, curr
+                desc = data.get("jobAd", {}).get("sections", {}).get("jobDescription", {}).get("text") or ""
+                parsed = parse_salary_text(re.sub(r"<[^>]+>", " ", desc), curr)
+                if parsed:
+                    return parsed
+        except Exception as e:
+            log.debug(f"SmartRecruiters API: {e}")
+
+    # Lever
+    lv = re.search(r"jobs\.lever\.co/([\w-]+)/([\w.-]+)", url)
+    if lv:
+        try:
+            r = requests.get(f"https://api.lever.co/v0/postings/{lv.group(1)}/{lv.group(2)}", timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                desc = data.get("descriptionPlain") or " ".join(s.get("content", "") for s in data.get("lists", []))
+                parsed = parse_salary_text(desc, curr)
+                if parsed:
+                    return parsed
+        except Exception as e:
+            log.debug(f"Lever API: {e}")
+
+    # Ashby
+    ash = re.search(r"jobs\.ashbyhq\.com/([\w-]+)/([\w-]+)", url)
+    if ash:
+        try:
+            r = requests.post(
+                "https://jobs.ashbyhq.com/api/non-user-graphql",
+                json={"operationName": "ApiJobPosting",
+                      "variables": {"organizationHostedJobsPageName": ash.group(1), "jobPostingId": ash.group(2)},
+                      "query": "query ApiJobPosting($organizationHostedJobsPageName:String!,$jobPostingId:String!)"
+                               "{jobPosting(organizationHostedJobsPageName:$organizationHostedJobsPageName,"
+                               "jobPostingId:$jobPostingId){compensationTierSummary descriptionPlain}}"},
+                timeout=15,
+            )
+            if r.status_code == 200:
+                jp = r.json().get("data", {}).get("jobPosting") or {}
+                for field in ("compensationTierSummary", "descriptionPlain"):
+                    parsed = parse_salary_text(jp.get(field) or "", curr)
+                    if parsed:
+                        return parsed
+        except Exception as e:
+            log.debug(f"Ashby API: {e}")
+
+    return None
+
+
+def _enrich_one(idx: int, row: dict) -> tuple[int, tuple | None]:
+    """Enrich 1 job: ATS API → HTML parse → JS render (cho redirect tracker)."""
+    curr = str(row.get("currency") or "CAD")
+    for url_key in ("job_url_direct", "job_url"):
+        url = str(row.get(url_key) or "").strip()
+        if not url.startswith("http"):
+            continue
+        if any(d in url for d in _REDIRECT_DOMAINS):
+            result = _parse_salary_from_html(_fetch_html(url, render=True), curr)
+        else:
+            result = _fetch_ats_salary(url, curr) or _parse_salary_from_html(_fetch_html(url), curr)
+        if result:
+            return idx, result
+        time.sleep(0.3)
+    return idx, None
+
+
 def enrich_salaries(df: pd.DataFrame) -> pd.DataFrame:
     """Fetch job pages để lấy salary cho các job N/A."""
-    mask  = df["salary_display"] == "N/A"
-    na_df = df[mask].head(ENRICH_MAX_JOBS)
+    na_df = df[df["salary_display"] == "N/A"].head(ENRICH_MAX_JOBS)
     if na_df.empty:
         log.info("Không có job N/A cần enrich."); return df
 
     log.info(f"🔍 Enriching {len(na_df)} jobs "
              f"({'ScraperAPI=ON' if SCRAPER_API_KEY else 'no ScraperAPI — coverage thấp'})...")
-
-    def _enrich_one(idx_row):
-        idx, row = idx_row
-        curr = str(row.get("currency") or "CAD")
-        for url in [row.get("job_url_direct"), row.get("job_url")]:
-            url_str = str(url or "").strip()
-            if not url_str.startswith("http"): continue
-            time.sleep(0.5)
-            html = _fetch_html(url_str)
-            result = _parse_salary_from_html(html, curr)
-            if result: return idx, result
-        return idx, None
-
     enriched = 0
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as ex:
-        futures = {ex.submit(_enrich_one, (idx, row)): idx for idx, row in na_df.iterrows()}
+        futures = {ex.submit(_enrich_one, idx, row.to_dict()): idx
+                   for idx, row in na_df.iterrows()}
         for i, fut in enumerate(as_completed(futures), 1):
             idx, result = fut.result()
             if result:
                 mn, mx, intv, curr = result
-                df.at[idx, "min_amount"]    = mn
-                df.at[idx, "max_amount"]    = mx
-                df.at[idx, "interval"]      = intv
-                df.at[idx, "currency"]      = curr
-                df.at[idx, "salary_source"] = "enriched"
+                df.at[idx, "min_amount"]     = mn
+                df.at[idx, "max_amount"]     = mx
+                df.at[idx, "interval"]       = intv
+                df.at[idx, "currency"]       = curr
+                df.at[idx, "salary_source"]  = "enriched"
                 df.at[idx, "salary_display"] = format_salary(df.loc[idx])
                 enriched += 1
                 log.info(f"  ✅ [{i}/{len(na_df)}] {df.at[idx,'title'][:30]} → {df.at[idx,'salary_display']}")
