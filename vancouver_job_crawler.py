@@ -275,32 +275,57 @@ def _build_proxies() -> dict | None:
 
 
 def _fetch_html(url: str, render: bool = False) -> str | None:
-    """Fetch HTML. render=True khi cần JS execution (redirect tracker, Workday, ATS)."""
-    if SCRAPER_API_KEY:
+    """
+    Fetch HTML with retry + JS rendering.
+    """
+
+    for attempt in range(3):
+
+        # ---------- ScraperAPI ----------
+        if SCRAPER_API_KEY:
+            try:
+                resp = requests.get(
+                    "https://api.scraperapi.com/",
+                    params={
+                        "api_key": SCRAPER_API_KEY,
+                        "url": url,
+                        "render": "true" if render else "false",
+                        "keep_headers": "true",
+                        "country_code": "ca",
+                    },
+                    timeout=90,
+                )
+
+                if resp.status_code == 200 and len(resp.text) > 5000:
+                    return resp.text
+
+            except Exception as e:
+                log.debug(f"ScraperAPI retry {attempt}: {e}")
+
+        # ---------- Direct request ----------
         try:
             resp = requests.get(
-                "https://api.scraperapi.com/",
-                params={"api_key": SCRAPER_API_KEY, "url": url,
-                        "render": "true" if render else "false",
-                        "country_code": "ca"},
-                timeout=60,
+                url,
+                headers={
+                    "User-Agent":
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36",
+                    "Accept-Language": "en-CA,en;q=0.9",
+                },
+                proxies=_build_proxies(),
+                timeout=30,
+                allow_redirects=True,
             )
-            if resp.status_code == 200:
+
+            if resp.status_code == 200 and len(resp.text) > 5000:
                 return resp.text
+
         except Exception as e:
-            log.debug(f"ScraperAPI error: {e}")
-    try:
-        resp = requests.get(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-                     "Accept-Language": "en-CA,en;q=0.9"},
-            proxies=_build_proxies(), timeout=20, allow_redirects=True,
-        )
-        if resp.status_code == 200:
-            return resp.text
-    except Exception as e:
-        log.debug(f"Fetch error {url[:60]}: {e}")
+            log.debug(f"Direct retry {attempt}: {e}")
+
+        time.sleep(2)
+
     return None
 
 
@@ -478,19 +503,37 @@ def _fetch_ats_salary(url: str, curr: str) -> tuple | None:
 
 
 def _enrich_one(idx: int, row: dict) -> tuple[int, tuple | None]:
-    """Enrich 1 job: ATS API → HTML parse → JS render (cho redirect tracker)."""
+
     curr = str(row.get("currency") or "CAD")
+
     for url_key in ("job_url_direct", "job_url"):
+
         url = str(row.get(url_key) or "").strip()
+
         if not url.startswith("http"):
             continue
-        if any(d in url for d in _REDIRECT_DOMAINS):
-            result = _parse_salary_from_html(_fetch_html(url, render=True), curr)
-        else:
-            result = _fetch_ats_salary(url, curr) or _parse_salary_from_html(_fetch_html(url), curr)
-        if result:
-            return idx, result
-        time.sleep(0.3)
+
+        try:
+
+            # ATS API FIRST
+            result = _fetch_ats_salary(url, curr)
+
+            if result:
+                return idx, result
+
+            # ALWAYS RENDER JS FOR INDEED
+            html = _fetch_html(url, render=True)
+
+            result = _parse_salary_from_html(html, curr)
+
+            if result:
+                return idx, result
+
+        except Exception as e:
+            log.debug(f"Enrich error: {e}")
+
+        time.sleep(1)
+
     return idx, None
 
 
