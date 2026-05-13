@@ -355,14 +355,21 @@ def _parse_salary_from_html(html: str, currency_hint: str = "CAD") -> tuple | No
     try:
         soup = BeautifulSoup(html, "lxml")
         for sel in _SALARY_SELECTORS:
-            el = soup.select_one(sel)
-            if not el:
-                continue
-            text = el.get_text(separator=" ", strip=True)
-            if "$" in text or "salary" in text.lower():
-                parsed = parse_salary_text(text, currency_hint)
-                if parsed:
-                    return parsed
+            elements = soup.select(sel)
+
+            for el in elements:
+
+                text = el.get_text(separator=" ", strip=True)
+
+                if not text:
+                    continue
+
+                if "$" in text or "salary" in text.lower():
+
+                    parsed = parse_salary_text(text, currency_hint)
+
+                    if parsed:
+                        return parsed
     except Exception:
         pass
 
@@ -422,6 +429,37 @@ def _fetch_ats_salary(url: str, curr: str) -> tuple | None:
       - Ashby         (2x): GraphQL API jobs.ashbyhq.com
     Remaining 11/45 là "OTHER" — companies không disclose salary (không fix được bằng code).
     """
+    # Greenhouse
+    gh = re.search(r"boards\.greenhouse\.io/([\w-]+)/jobs/(\d+)", url)
+
+    if gh:
+        try:
+            company = gh.group(1)
+            job_id = gh.group(2)
+
+            api = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs/{job_id}"
+
+            r = requests.get(api, timeout=15)
+
+            if r.status_code == 200:
+
+                data = r.json()
+
+                for field in [
+                    data.get("content", ""),
+                    data.get("metadata", {}).get("salary", ""),
+                ]:
+
+                    parsed = parse_salary_text(
+                        re.sub(r"<[^>]+>", " ", str(field)),
+                        curr
+                    )
+
+                    if parsed:
+                        return parsed
+
+        except Exception as e:
+            log.debug(f"Greenhouse API: {e}")
     # Workday
     wd = re.search(r"([\w-]+\.wd\d+\.myworkdayjobs\.com)/([^/]+)/job/[^/]+/[^/]+/([\w-]+)", url)
     if wd:
